@@ -211,7 +211,7 @@ Explore the library API directly with Cargo:
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
 - **Repository:** <https://github.com/gregoreesmaa/doc-photo-degrade>
 
-## License
+## License & Citation
 
 Dual-licensed under either of:
 
@@ -219,3 +219,16 @@ Dual-licensed under either of:
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option. All dependencies are permissive (MIT/BSD/Apache); no GPL/AGPL tools or external system binaries are required.
+
+If you use `doc-photo-degrade` in research or Document AI benchmarks, please cite:
+
+```bibtex
+@software{eesmaa_doc_photo_degrade_2026,
+  title        = {doc-photo-degrade: Deterministic, Margin-Safe Rust + WGPU Document Photo Degradation Engine},
+  author       = {Gregor Eesmaa and doc-photo-degrade contributors},
+  year         = {2026},
+  version      = {0.1.0},
+  license      = {MIT OR Apache-2.0},
+  url          = {https://github.com/gregoreesmaa/doc-photo-degrade}
+}
+```
