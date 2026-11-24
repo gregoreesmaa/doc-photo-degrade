@@ -5,6 +5,31 @@ All notable changes to `doc-photo-degrade` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-24
+
+Hyper-realism, physical paper-texture engines, independent per-corner detachment, and smartphone ISP release.
+
+### Added
+
+- **Independent Per-Corner Detachment (`CornerDetachConfig`, `QuadSdf2D`, `compute_detached_corners`, `visible_page_quads_out`):**
+  - Each of the 4 page corners independently detaches inward (`"inset"` revealing desk) or outward (`"offset"`, binary-searched against exact projective content safety so document ink never clips).
+  - Exact 2-Quad Output SDF (`QuadSdf2D` on `Q_out` & `R_out`) unifies slanted detached desk texture, contact drop-shadow, and `OUT_OF_PAGE` ground-truth mask parity (`< 0.2 px` rendered centroid error preserved).
+  - CLI flags `--no-corner-detach` and `--corner-inset-prob`, builder methods `.corner_detach(...)` and `.corner_detach_inset_prob(...)`, and `DegradeParams` fields `corner_detach_px` and `corner_detach_modes`.
+- **5 Physical Paper-Texture & Micro-Surface Engines (`paper.rs`, `banks.rs`, `realism.rs`):**
+  - **256×256 Torus Micro-Weave Bank (`WeaveStock`):** seamless laid (chain+laid wire ribs), wove, and cold-press watercolor paper grain calibrated per profile.
+  - **Y-Sorted Cellulose Fibers, Recycled Pulp Flecks & Lint (`PulpInclusionConfig`):** cache-friendly curved Bezier cellulose/rag fibers, L1-resident 7×7 wood-chip flecks, and stray surface lint with scanner-glass micro-shadows.
+  - **Archival Chemical Aging (`apply_archival_paper`):** O(W+H) edge-oxidation LUT, organic ferric-oxide foxing clusters, translucent corner finger-oil handling grease, and subtle papermaker watermarks.
+  - **Micro-Surface BRDF (`PaperStock`):** stock-specific albedo ceiling, Dmax black floor, OBA fluorescence, velvet highlight rolloff, and zero-centroid-shift capillary ink spread (`CoatedGlossy`, `ThermalReceipt`, `MatteOfficeBond`, `PorousNewsprint`, `UncoatedRag`), plus `.paper_stock(...)` builder override.
+  - **Fused 3D Micro-Relief (`apply_micro_relief_shading`):** 6-octave phasor 3D paper cockling (3–5× faster than the legacy `4×cos` crumple loop) + 256×256 raking-light paper-tooth bump (ink-core protected) + intaglio plate-mark & book-gutter emboss.
+- **Camera Optics, Smartphone ISP, Print/Scan Physics & Environment (CPU + WGPU Shader Fusion):**
+  - Handheld phone + hand cast shadow SDF (with cool skylight fill) and anisotropic glossy specular bloom + C1 highlight rolloff fused into Stage 5 lighting (CPU + WGPU `LIGHTING_SHADER`).
+  - 3D bend-coupled Lambertian normal shading fused into Stage 2 bend (CPU + WGPU `BEND_SHADER`).
+  - Off-axis cubic radial chromatic aberration and Petzval field-curvature corner softness (CPU + WGPU `CA_SHADER` + `CHAIN_BLUR`).
+  - Filmic smartphone auto-exposure & S-curve 3×256 tone-mapping LUT (`vec_to_image_with_lut`), 1/4-res High-ISO Cb/Cr chroma blotch noise (CPU + WGPU `NOISE_SHADER`), unrolled edge-aware HDR USM, and optional shifted double-JPEG (`jpeg_roundtrip_shifted`, 0.00 px drift).
+  - Capillary coffee/water tide-ring stains with ink bleed, dihedral fold creases with ink-flake cracking, Xerox fuser drum ghosting (8×8 tile-skipped), thermal receipt uneven fade & heat-friction scratches, flatbed scanner lid edge bar + CCD dust lines, and ink-only micro-texture / halftone grain.
+  - Richer procedural LUT desks (`DeskLut`: `walnut`, `oak`, `granite_laminate`, `slate`, `cloth`), optional margin-safe music-stand bottom ledge (`STAND_LEDGE`), margin-safe fingertip / binder-clip edge occluder (`FINGER`, `BINDER_CLIP`), serrated translucent scotch tape v2 with diagonal specular sheen, and depth-shadowed desk-through binder punch holes.
+- **Full v0.2 JSON Backward Compatibility:** all new `DegradeParams` and `CaptureParams` fields use `#[serde(default)]`.
+
 ## [0.2.0] - 2026-11-24
 
 Major accuracy, multi-task supervision, and photorealism release.

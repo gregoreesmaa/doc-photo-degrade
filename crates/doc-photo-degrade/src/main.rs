@@ -118,6 +118,14 @@ struct Args {
     /// Format for exported floating-point masks: `npy-png` (default) or `png16`.
     #[arg(long, default_value = "npy-png")]
     mask_format: String,
+
+    /// Disable independent per-corner detachment (reverts to legacy global inset/tight framing).
+    #[arg(long, default_value_t = false)]
+    no_corner_detach: bool,
+
+    /// Per-corner probability of `"inset"` vs `"offset"` when corner detachment is active (default: 0.60).
+    #[arg(long)]
+    corner_inset_prob: Option<f32>,
 }
 
 fn main() {
@@ -202,6 +210,12 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
     if args.export_masks {
         base_cfg.masks = MaskRequest::all();
+    }
+    if args.no_corner_detach {
+        base_cfg.corner_detach = doc_photo_degrade::CornerDetachConfig::disabled();
+    }
+    if let Some(prob) = args.corner_inset_prob {
+        base_cfg.corner_detach.inset_prob = prob.clamp(0.0, 1.0);
     }
     base_cfg.validate()?;
 
@@ -396,6 +410,7 @@ fn init_gpu(args: &Args) -> Result<Option<doc_photo_degrade::Gpu>, String> {
                         rip_fx: 1.5,
                         rip_fy: 1.2,
                         rip_ph: 0.3,
+                        ..doc_photo_degrade_gpu::gpu::BendKnobs::default()
                     },
                     persp_inv: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                     rot_deg: 2.0,
@@ -409,13 +424,10 @@ fn init_gpu(args: &Args) -> Result<Option<doc_photo_degrade::Gpu>, String> {
                         sh_dy: 0.0,
                         shadow_strength: 0.1,
                         vignette_strength: 0.1,
-                        awb_dx: 1.0,
-                        awb_dy: 0.0,
-                        awb_strength: 0.0,
+                        ..doc_photo_degrade_gpu::gpu::LightingKnobs::default()
                     },
                     ca_px: 0.5,
                     noise_sigma: 5.0,
-                    noise_shot_sigma: 0.0,
                     noise_seed: 7,
                     run_grain: true,
                     run_bend: true,
@@ -425,14 +437,12 @@ fn init_gpu(args: &Args) -> Result<Option<doc_photo_degrade::Gpu>, String> {
                     run_light: true,
                     run_ca: true,
                     run_noise: true,
-                    tilt_active: false,
-                    focus_y: 0.0,
-                    focus_h: 0.0,
                     run_affine: true,
                     affine_rows: rows,
                     affine_meta: meta,
                     affine_nw: nw.max(1),
                     affine_nh: nh.max(1),
+                    ..doc_photo_degrade_gpu::chain::ChainConfig::default()
                 },
             );
             Ok(Some(g))

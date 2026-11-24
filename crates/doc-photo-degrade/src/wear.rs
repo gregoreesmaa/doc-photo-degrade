@@ -8,7 +8,7 @@ use rand_chacha::ChaCha8Rng;
 const PAPER: [f32; 3] = [244.0, 241.0, 235.0];
 const PAPER_LUM: f32 = 241.19;
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct WearParams {
     pub enabled: bool,
     pub heavy_zones: [[f32; 4]; 3],
@@ -72,6 +72,86 @@ fn apply_toner_band(
             }
         }
     }
+}
+
+/// Single-pass 8×8 tile-skipped vertical Xerox/laser fuser drum ghosting.
+/// Reads `snap` (pre-wear luma) at `y - period` and blends faint residual toner
+/// onto `buf` strictly from heavy dark ink (`luma < 155.0`).
+pub(crate) fn apply_drum_ghost(
+    buf: &mut [f32],
+    snap: &[f32],
+    wsz: usize,
+    hsz: usize,
+    period: usize,
+    alpha: f32,
+) {
+    if alpha <= 0.0 || period == 0 || period >= hsz {
+        return;
+    }
+    const TILE: usize = 8;
+    const DARK_THRESH: f32 = 155.0;
+    let gain = alpha * 115.0;
+    for ty in (period..hsz).step_by(TILE) {
+        let y_end = (ty + TILE).min(hsz);
+        for tx in (0..wsz).step_by(TILE) {
+            let x_end = (tx + TILE).min(wsz);
+            let mut min_luma = 255.0f32;
+            for y in ty..y_end {
+                let srow = (y - period) * wsz;
+                for x in tx..x_end {
+                    let v = snap[srow + x];
+                    if v < min_luma {
+                        min_luma = v;
+                    }
+                }
+            }
+            if min_luma >= DARK_THRESH {
+                continue;
+            }
+            for y in ty..y_end {
+                let srow = (y - period) * wsz;
+                let drow = y * wsz;
+                for x in tx..x_end {
+                    let l = snap[srow + x];
+                    if l < DARK_THRESH {
+                        let d = ((DARK_THRESH - l) / DARK_THRESH).clamp(0.0, 1.0);
+                        let sub = gain * d;
+                        let j = (drow + x) * 3;
+                        buf[j] = (buf[j] - sub).clamp(0.0, 255.0);
+                        buf[j + 1] = (buf[j + 1] - sub).clamp(0.0, 255.0);
+                        buf[j + 2] = (buf[j + 2] - sub).clamp(0.0, 255.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply Xerox/laser fuser drum ghosting directly on `buf` (building a luma
+/// snapshot once and calling [`apply_drum_ghost`]).
+pub(crate) fn apply_drum_ghost_pass(
+    buf: &mut [f32],
+    w: u32,
+    h: u32,
+    rng: &mut ChaCha8Rng,
+    strength: f32,
+    px: f32,
+) -> (u32, f32) {
+    let s = strength.clamp(0.0, 1.0);
+    let (wsz, hsz) = (w as usize, h as usize);
+    if s <= 0.05 || wsz < 8 || hsz < 24 || buf.len() < wsz * hsz * 3 {
+        return (0, 0.0);
+    }
+    let period = (rng.gen_range(180.0..260.0) * px).round().max(16.0) as u32;
+    let alpha = s * rng.gen_range(0.04..0.11);
+    let snap: Vec<f32> = buf
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])
+        .collect();
+    apply_drum_ghost(buf, &snap, wsz, hsz, period as usize, alpha);
+    (period, alpha)
 }
 
 /// Misregistration echo with fully-paper 8x8 tiles skipped (Swap 2

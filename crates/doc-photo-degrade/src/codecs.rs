@@ -95,6 +95,61 @@ pub(crate) fn vec_to_image(buf: &[f32], w: u32, h: u32) -> RgbImage {
     RgbImage::from_raw(w, h, bytes).expect("buffer size matches dimensions")
 }
 
+/// Convert interleaved RGB `f32` buffer to `RgbImage` while applying a 3×256
+/// per-channel filmic tone-curve LUT in a single pass (zero extra DRAM pass).
+pub(crate) fn vec_to_image_with_lut(buf: &[f32], w: u32, h: u32, lut: &[[u8; 256]; 3]) -> RgbImage {
+    let mut bytes = Vec::with_capacity(buf.len());
+    for px in buf.as_chunks::<3>().0 {
+        bytes.push(lut[0][px[0].clamp(0.0, 255.0) as usize]);
+        bytes.push(lut[1][px[1].clamp(0.0, 255.0) as usize]);
+        bytes.push(lut[2][px[2].clamp(0.0, 255.0) as usize]);
+    }
+    RgbImage::from_raw(w, h, bytes).expect("buffer size matches dimensions")
+}
+
+/// Misaligned 8×8 DCT double-compression pass (Pass-1 of WhatsApp/messaging
+/// double-JPEG): pads top/left by `(dx, dy)` using edge replication, encodes
+/// 4:2:0 JPEG at `quality`, decodes, and crops back to `(w, h)` with 0.00 px
+/// geometric drift.
+pub(crate) fn jpeg_roundtrip_shifted(
+    img: &RgbImage,
+    quality: u8,
+    dx: u32,
+    dy: u32,
+) -> Option<RgbImage> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (pw, ph) = (w + dx, h + dy);
+    let src = img.as_raw();
+    let row_bytes = (w as usize) * 3;
+    let prow_bytes = (pw as usize) * 3;
+    let mut padded = vec![0u8; prow_bytes * (ph as usize)];
+    for y in 0..ph {
+        let sy = y.saturating_sub(dy).min(h - 1) as usize;
+        let srow = &src[sy * row_bytes..(sy + 1) * row_bytes];
+        let drow = &mut padded[(y as usize) * prow_bytes..(y as usize + 1) * prow_bytes];
+        for x in 0..dx as usize {
+            drow[x * 3..x * 3 + 3].copy_from_slice(&srow[0..3]);
+        }
+        drow[(dx as usize) * 3..].copy_from_slice(srow);
+    }
+    let (bytes, _) = encode_jpeg_bytes(&padded, pw, ph, quality).ok()?;
+    let dec = decode_jpeg_bytes(&bytes, "jpeg pass-1 shifted").ok()?;
+    if dec.width() != pw || dec.height() != ph {
+        return None;
+    }
+    let dsrc = dec.as_raw();
+    let mut cropped = vec![0u8; row_bytes * (h as usize)];
+    for y in 0..h as usize {
+        let s_off = (y + dy as usize) * prow_bytes + (dx as usize) * 3;
+        cropped[y * row_bytes..(y + 1) * row_bytes]
+            .copy_from_slice(&dsrc[s_off..s_off + row_bytes]);
+    }
+    RgbImage::from_raw(w, h, cropped)
+}
+
 /// Fast-codec input loader: PNG via `zune-png`, JPEG via `zune-jpeg`,
 /// anything else rejected. Any depth/layout becomes RGB8.
 ///

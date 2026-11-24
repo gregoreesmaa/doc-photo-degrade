@@ -8,7 +8,7 @@ use rand_chacha::ChaCha8Rng;
 const PAPER: [f32; 3] = [244.0, 241.0, 235.0];
 const PAPER_LUM: f32 = 241.19;
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct InkParams {
     pub enabled: bool,
     pub fade_amount: f32,
@@ -302,6 +302,166 @@ pub fn apply_with(
     }
 
     params
+}
+
+/// Thermal receipt uneven fade, leuco-dye color cast, and dark heat-friction
+/// scratch streaks (Stage 1c.5 when `enable_thermal_physics` is active).
+pub(crate) fn apply_thermal_physics(
+    buf: &mut [f32],
+    w: u32,
+    h: u32,
+    rng: &mut ChaCha8Rng,
+    strength: f32,
+    px: f32,
+) -> (f32, String, u32) {
+    let s = strength.clamp(0.0, 1.0);
+    let (wsz, hsz) = (w as usize, h as usize);
+    if s <= 0.05 || wsz < 8 || hsz < 8 || buf.len() < wsz * hsz * 3 {
+        return (0.0, "none".to_string(), 0);
+    }
+    let thermal_fade = s * rng.gen_range(0.35..0.75);
+    let thermal_tone = if rng.gen::<f32>() < 0.65 {
+        "purple_gray"
+    } else {
+        "warm_brown"
+    };
+    let thermal_scratches = rng.gen_range(2..=5u32);
+    let dye_tint: [f32; 3] = if thermal_tone == "purple_gray" {
+        [96.0, 90.0, 122.0]
+    } else {
+        [122.0, 98.0, 80.0]
+    };
+
+    let (wf, hf) = (wsz as f32, hsz as f32);
+    let tau = std::f32::consts::TAU;
+    let f1 = rng.gen_range(2.0..6.0);
+    let f2 = rng.gen_range(7.0..15.0);
+    let ph = rng.gen_range(0.0..tau);
+    let mut head_col = vec![1.0f32; wsz];
+    for (x, slot) in head_col.iter_mut().enumerate() {
+        let nx = x as f32 / wf;
+        let dip = 0.5 + 0.35 * (tau * f1 * nx + ph).sin() + 0.15 * (tau * f2 * nx + 1.3 * ph).cos();
+        *slot = (1.0 - thermal_fade * 0.55 * dip).clamp(0.28, 1.0);
+    }
+    for y in 0..hsz {
+        let row = y * wsz;
+        for (x, &k_th) in head_col.iter().enumerate() {
+            let j = (row + x) * 3;
+            let l = 0.299 * buf[j] + 0.587 * buf[j + 1] + 0.114 * buf[j + 2];
+            if l < 185.0 {
+                let d = ((PAPER_LUM - l) / PAPER_LUM).clamp(0.0, 1.0);
+                let blend = (d * (1.0 - k_th * 0.65)).clamp(0.0, 0.85);
+                for c in 0..3 {
+                    let lifted = PAPER[c] - (PAPER[c] - buf[j + c]) * k_th;
+                    buf[j + c] = (lifted * (1.0 - blend * 0.45) + dye_tint[c] * (blend * 0.45))
+                        .clamp(0.0, 255.0);
+                }
+            }
+        }
+    }
+
+    // Sparse ROI dark heat-friction scratch streaks.
+    for _ in 0..thermal_scratches {
+        let mut sx = rng.gen_range(0.05..0.95) * wf;
+        let mut sy = rng.gen_range(0.05..0.95) * hf;
+        let ang = rng.gen_range(-0.45..0.45f32)
+            + if rng.gen::<bool>() {
+                0.0
+            } else {
+                std::f32::consts::FRAC_PI_2
+            };
+        let len = (rng.gen_range(45.0..190.0) * px).round().max(8.0) as usize;
+        let (dx, dy) = (ang.cos(), ang.sin());
+        let curv = rng.gen_range(-0.004..0.004f32);
+        let darkness = s * rng.gen_range(0.35..0.68);
+        for step in 0..len {
+            let t = step as f32 / (len.max(1) as f32);
+            let taper = (t * (1.0 - t) * 4.0).sqrt();
+            let a = darkness * taper;
+            let ix = sx.round() as i32;
+            let iy = sy.round() as i32;
+            for oy in -1..=1i32 {
+                for ox in -1..=1i32 {
+                    let (xx, yy) = (ix + ox, iy + oy);
+                    if xx >= 0 && yy >= 0 && xx < wsz as i32 && yy < hsz as i32 {
+                        let w_px = if ox == 0 && oy == 0 { a } else { a * 0.35 };
+                        let j = (yy as usize * wsz + xx as usize) * 3;
+                        for c in 0..3 {
+                            buf[j + c] =
+                                (buf[j + c] * (1.0 - w_px) + 38.0 * w_px).clamp(0.0, 255.0);
+                        }
+                    }
+                }
+            }
+            sx += dx - dy * curv * step as f32;
+            sy += dy + dx * curv * step as f32;
+        }
+    }
+    (thermal_fade, thermal_tone.to_string(), thermal_scratches)
+}
+
+/// Fast ink-only micro-feathering & halftone/toner grain (strictly dark ink
+/// `luma < 140.0`, skipping ~90% of white paper pixels).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_ink_micro_texture(
+    buf: &mut [f32],
+    w: u32,
+    h: u32,
+    file_seed: u64,
+    grain_sigma: f32,
+    feather_amp: f32,
+    halftone_amp: f32,
+) {
+    if grain_sigma <= 0.0 && feather_amp <= 0.0 && halftone_amp <= 0.0 {
+        return;
+    }
+    let (wsz, hsz) = (w as usize, h as usize);
+    if wsz == 0 || hsz == 0 || buf.len() < wsz * hsz * 3 {
+        return;
+    }
+    let tile = crate::banks::BANK_TILE as usize;
+    let mask = tile - 1;
+    let bank =
+        crate::banks::generate_gauss_bank(file_seed, crate::banks::TAG_INK_TEX, tile as u32, 1.0);
+    const BAYER4: [f32; 16] = [
+        -0.94, 0.06, -0.69, 0.31, 0.56, -0.44, 0.81, -0.19, -0.56, 0.44, -0.81, 0.19, 0.94, -0.06,
+        0.69, -0.31,
+    ];
+    let snap: Vec<f32> = buf
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])
+        .collect();
+
+    for y in 0..hsz {
+        let row = y * wsz;
+        let brow = (y & mask) * tile;
+        let by4 = (y & 3) * 4;
+        for x in 0..wsz {
+            let idx = row + x;
+            let l = snap[idx];
+            if l >= 140.0 {
+                continue;
+            }
+            let b_val = bank[brow + (x & mask)];
+            let lx = if x > 0 { snap[idx - 1] } else { l };
+            let rx = if x + 1 < wsz { snap[idx + 1] } else { l };
+            let is_edge = (lx - l).abs() > 35.0 || (rx - l).abs() > 35.0;
+            let ink_w = ((140.0 - l) / 140.0).clamp(0.0, 1.0);
+            let mut delta = b_val * grain_sigma * (0.45 + 0.55 * ink_w);
+            if is_edge && feather_amp > 0.0 {
+                delta += bank[brow + ((x + 17) & mask)] * feather_amp;
+            }
+            if halftone_amp > 0.0 {
+                delta += BAYER4[by4 + (x & 3)] * halftone_amp * ink_w;
+            }
+            let j = idx * 3;
+            buf[j] = (buf[j] + delta).clamp(0.0, 255.0);
+            buf[j + 1] = (buf[j + 1] + delta).clamp(0.0, 255.0);
+            buf[j + 2] = (buf[j + 2] + delta).clamp(0.0, 255.0);
+        }
+    }
 }
 
 #[cfg(test)]

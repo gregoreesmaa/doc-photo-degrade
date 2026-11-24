@@ -59,13 +59,25 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
     let blurred = acc / norm;
     var out = blurred;
-    if (prm.b.x > 0.5) {
-        let hgt = max(f32(dims.dst_h), 1.0);
-        let d = abs(f32(y) / hgt - prm.a.z);
-        var m = clamp((d - prm.a.w) / 0.08, 0.0, 1.0);
-        m = m * m * (3.0 - 2.0 * m);
+    let fc = prm.b.y;
+    if (prm.b.x > 0.5 || fc > 0.0) {
+        let wf = max(f32(dims.dst_w), 1.0);
+        let hf = max(f32(dims.dst_h), 1.0);
+        var m = select(0.45, 0.0, prm.b.x > 0.5);
+        if (prm.b.x > 0.5) {
+            let d = abs(f32(y) / hf - prm.a.z);
+            let mt = clamp((d - prm.a.w) / 0.08, 0.0, 1.0);
+            m = mt * mt * (3.0 - 2.0 * mt);
+        }
+        if (fc > 0.0) {
+            let max_r = max(0.5 * length(vec2<f32>(wf, hf)), 1.0);
+            let rn = vec2<f32>(f32(x) - wf * prm.b.z, f32(y) - hf * prm.b.w) / max_r;
+            let t = clamp((dot(rn, rn) - 0.20) / 0.80, 0.0, 1.0);
+            let m_fc = fc * t * t * (3.0 - 2.0 * t);
+            m = select(clamp(0.45 + 0.55 * m_fc, 0.0, 1.0), max(m, m_fc), prm.b.x > 0.5);
+        }
         let sharp = tap(i32(x), i32(y));
-        out = sharp * (1.0 - m) + blurred * m;
+        out = mix(sharp, blurred, m);
     }
     let i = (y * dims.dst_w + x) * 3u;
     dst[i] = out.x;
@@ -87,13 +99,23 @@ pub struct ChainConfig {
     pub bend: BendKnobs,
     /// Row-major 3x3 inverse map for the perspective warp.
     pub persp_inv: [f32; 9],
+    /// Out-of-bounds fill RGB for perspective warp (paper tone or desk tone when detached).
+    pub persp_fill: [f32; 3],
     /// Rotation degrees (positive = clockwise in image coordinates).
     pub rot_deg: f32,
     pub blur_sigma: f32,
+    /// Petzval field-curvature corner softness weight (`0.0` = off).
+    pub field_curvature: f32,
     pub light: LightingKnobs,
     pub ca_px: f32,
+    /// Decentered optical axis `[ox, oy]` in `[0..1]^2` for radial CA & field curvature.
+    pub ca_optical_center: [f32; 2],
+    /// Cubic radial CA weight (`0.0` = legacy linear, `0.75` = cubic wide-angle).
+    pub ca_cubic_weight: f32,
     pub noise_sigma: f32,
     pub noise_shot_sigma: f32,
+    /// 1/4-res High-ISO Cb/Cr chroma blotch noise sigma (`0.0` = off).
+    pub chroma_noise_sigma: f32,
     pub noise_seed: u32,
     /// Per-stage run flags (false = skip pass; resident buffer untouched).
     pub run_grain: bool,
@@ -127,37 +149,19 @@ impl Default for ChainConfig {
             grain_speckle_prob: 0.0,
             grain_strength: 0.0,
             grain_warm: [0.0; 3],
-            bend: BendKnobs {
-                mode: 2,
-                edge_id: 0,
-                curl_px: 0.0,
-                curl_shade: 0.0,
-                spine_cx: 0.0,
-                spine_w: 1.0,
-                depth: 0.0,
-                rip_fx: 0.0,
-                rip_fy: 0.0,
-                rip_ph: 0.0,
-            },
+            bend: BendKnobs::default(),
             persp_inv: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            persp_fill: [246.0, 243.0, 236.0],
             rot_deg: 0.0,
             blur_sigma: 0.0,
-            light: LightingKnobs {
-                gx: 0.0,
-                gy: 0.0,
-                glare_radius: 10.0,
-                glare_alpha: 0.0,
-                sh_dx: 1.0,
-                sh_dy: 0.0,
-                shadow_strength: 0.0,
-                vignette_strength: 0.0,
-                awb_dx: 0.0,
-                awb_dy: 0.0,
-                awb_strength: 0.0,
-            },
+            field_curvature: 0.0,
+            light: LightingKnobs::default(),
             ca_px: 0.0,
+            ca_optical_center: [0.5, 0.5],
+            ca_cubic_weight: 0.0,
             noise_sigma: 0.0,
             noise_shot_sigma: 0.0,
+            chroma_noise_sigma: 0.0,
             noise_seed: 0,
             run_grain: false,
             run_bend: false,

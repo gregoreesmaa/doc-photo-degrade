@@ -9,7 +9,7 @@ use rand_chacha::ChaCha8Rng;
 use std::f32::consts::PI;
 
 /// Sampled knobs for the capture/handling degradation pass.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct CaptureParams {
     pub enabled: bool,
     pub motion_angle_deg: f32,
@@ -37,6 +37,12 @@ pub struct CaptureParams {
     pub exposure_compress: f32,
     pub banding_amplitude: f32,
     pub banding_period: u32,
+    /// True when the edge tape strip uses serrated dispenser-torn ends and diagonal sheen.
+    #[serde(default)]
+    pub tape_serrated: bool,
+    /// True when binder punch holes render continuous desk texture through the hole.
+    #[serde(default)]
+    pub hole_desk_through: bool,
 }
 
 fn ru(rng: &mut ChaCha8Rng, lo: u32, hi: u32, max: u32) -> u32 {
@@ -77,6 +83,8 @@ fn off() -> CaptureParams {
         exposure_compress: 1.0,
         banding_amplitude: 0.0,
         banding_period: 4,
+        tape_serrated: false,
+        hole_desk_through: false,
     }
 }
 
@@ -162,29 +170,31 @@ pub fn apply(
         banding_amplitude: rng.gen_range(1.5..4.0) * s,
         banding_period: rng
             .gen_range((3.0 * px).round().max(2.0) as u32..(7.0 * px).round().max(3.0) as u32),
+        tape_serrated: true,
+        hole_desk_through: false,
     };
-    // Exposure error: global lift + slight contrast compression about mid-grey.
-    for v in buf.iter_mut() {
-        *v = ((*v - 128.0) * p.exposure_compress + 128.0 + p.exposure_lift).clamp(0.0, 255.0);
-    }
-    // Faint sensor banding: low-amplitude horizontal stripes.
+    // Fuse exposure error + sensor banding into the motion-blur snapshot build
+    // (1 pass instead of 3 DRAM passes, bit-identical arithmetic).
+    let mut snap = vec![0.0f32; (w as usize) * (h as usize) * 3];
+    let inv_bp = 2.0 * PI / p.banding_period as f32;
     for y in 0..h {
-        let off = p.banding_amplitude * (2.0 * PI * y as f32 / p.banding_period as f32).sin();
-        for x in 0..w {
-            let i = (y * w + x) as usize * 3;
-            for c in 0..3 {
-                buf[i + c] = (buf[i + c] + off).clamp(0.0, 255.0);
-            }
+        let off = p.banding_amplitude * (y as f32 * inv_bp).sin();
+        let row_base = (y * w) as usize * 3;
+        let row_end = row_base + (w as usize) * 3;
+        for (dst_v, &src_v) in snap[row_base..row_end]
+            .iter_mut()
+            .zip(buf[row_base..row_end].iter())
+        {
+            let exp_v =
+                ((src_v - 128.0) * p.exposure_compress + 128.0 + p.exposure_lift).clamp(0.0, 255.0);
+            *dst_v = (exp_v + off).clamp(0.0, 255.0);
         }
     }
     // Motion blur: directional box blur along the seeded angle.
-    // Tap offsets depend only on `k`, so hoist them out of the pixel loop
-    // (same rounded values, same accumulation order — bit-exact).
-    let snap = buf.to_vec();
     let th = p.motion_angle_deg * PI / 180.0;
     let (dx, dy) = (th.cos(), th.sin());
     let r = p.motion_radius as i32;
-    let taps = (2 * r + 1) as f32;
+    let inv_taps = 1.0 / (2 * r + 1) as f32;
     let offs: Vec<(i32, i32)> = (-r..=r)
         .map(|k| {
             (
@@ -193,21 +203,34 @@ pub fn apply(
             )
         })
         .collect();
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
+    let wi = w as i32;
+    let hi = h as i32;
+    let ws = w as usize;
+    for y in 0..hi {
+        let y_interior = y >= r && y + r < hi;
+        for x in 0..wi {
             let mut acc = [0.0f32; 3];
-            for (ox, oy) in offs.iter() {
-                let nx = (x + ox).clamp(0, w as i32 - 1);
-                let ny = (y + oy).clamp(0, h as i32 - 1);
-                let j = (ny as u32 * w + nx as u32) as usize * 3;
-                for c in 0..3 {
-                    acc[c] += snap[j + c];
+            if y_interior && x >= r && x + r < wi {
+                for &(ox, oy) in &offs {
+                    let j = ((y + oy) as usize * ws + (x + ox) as usize) * 3;
+                    acc[0] += snap[j];
+                    acc[1] += snap[j + 1];
+                    acc[2] += snap[j + 2];
+                }
+            } else {
+                for &(ox, oy) in &offs {
+                    let nx = (x + ox).clamp(0, wi - 1) as usize;
+                    let ny = (y + oy).clamp(0, hi - 1) as usize;
+                    let j = (ny * ws + nx) * 3;
+                    acc[0] += snap[j];
+                    acc[1] += snap[j + 1];
+                    acc[2] += snap[j + 2];
                 }
             }
-            let i = (y as u32 * w + x as u32) as usize * 3;
-            for c in 0..3 {
-                buf[i + c] = acc[c] / taps;
-            }
+            let i = (y as usize * ws + x as usize) * 3;
+            buf[i] = acc[0] * inv_taps;
+            buf[i + 1] = acc[1] * inv_taps;
+            buf[i + 2] = acc[2] * inv_taps;
         }
     }
     // Fingerprint: fingertip ellipse of concentric arc ridges + oil brightening.
@@ -228,67 +251,76 @@ pub fn apply(
             }
         }
     }
-    // Tape strip: translucent beige band along one edge (partial span, like
-    // a real piece of tape) + sheen line. Any edge, never full-width, so it
-    // reads as tape rather than a tinted band across the page.
-    const BEIGE: [f32; 3] = [225.0, 205.0, 165.0];
+    // Tape strip v2: translucent frosted or aged cellophane along one edge
+    // (partial span) with serrated dispenser-torn ends, milky adhesive rims,
+    // and a diagonal glossy specular sheen band.
     {
+        let clear_frosted = (p.tape_edge + p.sticky_tone).is_multiple_of(3);
+        let tape_rgb: [f32; 3] = if clear_frosted {
+            [235.0, 233.0, 226.0]
+        } else {
+            [225.0, 205.0, 165.0]
+        };
         let t = p.tape_height.min(w.min(h));
         let along = if p.tape_edge.is_multiple_of(2) { w } else { h };
         let a0 = ((p.tape_start_frac * along as f32) as u32).min(along);
         let a1 = ((p.tape_start_frac + p.tape_len_frac) * along as f32) as u32;
         let (a0, a1) = (a0.min(along), a1.min(along).max(a0 + 1));
-        let mut paint = |px: u32, py: u32| {
+        let tooth_p = (t / 6).max(3) as f32;
+        let span = (a1 - a0).max(1) as f32;
+        let t_f = t.max(1) as f32;
+        let mut paint_tape = |px: u32, py: u32, u: u32, a: u32| {
+            let serr = ((u as f32 % tooth_p) - tooth_p * 0.5).abs() / (tooth_p * 0.5);
+            let trim = (serr * 3.5) as u32;
+            if a < a0 + trim || a + trim >= a1 {
+                return;
+            }
             if px < w && py < h {
+                let end_frost = if a < a0 + trim + 2 || a + trim + 2 >= a1 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let rim_frost = if u < 2 || u + 2 >= t { 1.0 } else { 0.0 };
+                let alpha = (p.tape_opacity + 0.08 * end_frost + 0.05 * rim_frost).min(0.65);
+                let un = (u as f32 / t_f) - 0.5;
+                let an = ((a - a0) as f32 / span) - 0.5;
+                let sheen_d = (an * 0.82 + un * 0.57) * 4.5;
+                let spec = (-sheen_d * sheen_d).exp() * (24.0 + 9.0 * (an * 18.0).sin());
                 let i = (py * w + px) as usize * 3;
                 for c in 0..3 {
-                    buf[i + c] = buf[i + c] * (1.0 - p.tape_opacity) + BEIGE[c] * p.tape_opacity;
+                    buf[i + c] =
+                        (buf[i + c] * (1.0 - alpha) + tape_rgb[c] * alpha + spec).clamp(0.0, 255.0);
                 }
             }
         };
         match p.tape_edge % 4 {
             0 => {
-                for y in 0..t {
-                    for x in a0..a1 {
-                        paint(x, y);
+                for u in 0..t {
+                    for a in a0..a1 {
+                        paint_tape(a, u, u, a);
                     }
                 }
             }
             1 => {
-                for y in 0..t {
-                    for x in a0..a1 {
-                        paint(w - 1 - y.min(w - 1), x);
+                for u in 0..t {
+                    for a in a0..a1 {
+                        paint_tape(w - 1 - u.min(w - 1), a, u, a);
                     }
                 }
             }
             2 => {
-                for y in 0..t {
-                    for x in a0..a1 {
-                        paint(x, h - 1 - y.min(h - 1));
+                for u in 0..t {
+                    for a in a0..a1 {
+                        paint_tape(a, h - 1 - u.min(h - 1), u, a);
                     }
                 }
             }
             _ => {
-                for y in 0..t {
-                    for x in a0..a1 {
-                        paint(y, x);
+                for u in 0..t {
+                    for a in a0..a1 {
+                        paint_tape(u, a, u, a);
                     }
-                }
-            }
-        }
-        // Sheen line down the middle of the strip.
-        let mid = t / 2;
-        for a in a0..a1 {
-            let (sx, sy) = match p.tape_edge % 4 {
-                0 => (a, mid),
-                1 => (w - 1 - mid.min(w - 1), a),
-                2 => (a, h - 1 - mid.min(h - 1)),
-                _ => (mid, a),
-            };
-            if sx < w && sy < h {
-                let i = (sy * w + sx) as usize * 3;
-                for c in 0..3 {
-                    buf[i + c] = (buf[i + c] + 25.0).clamp(0.0, 255.0);
                 }
             }
         }

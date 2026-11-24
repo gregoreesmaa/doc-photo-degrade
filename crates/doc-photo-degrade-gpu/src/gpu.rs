@@ -156,7 +156,7 @@ pub fn run_pointwise(
     src_host: &[f32],
     w: u32,
     h: u32,
-    prm: [f32; 16],
+    prm: &[f32],
 ) -> Vec<f32> {
     use wgpu::util::DeviceExt;
     let n = (w * h * 3) as usize;
@@ -181,7 +181,7 @@ pub fn run_pointwise(
     });
     let prm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
-        contents: bytemuck::cast_slice(&prm),
+        contents: bytemuck::cast_slice(prm),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -257,7 +257,8 @@ pub struct GpuContext {
 }
 
 /// Knobs for lighting stage 5: glare disc, shadow direction, vignette,
-/// and optional mixed-illuminant AWB warm-to-cool gradient.
+/// mixed-illuminant AWB, handheld phone+hand cast shadow, and anisotropic
+/// glossy specular bloom with soft highlight rolloff.
 #[derive(Clone, Copy)]
 pub struct LightingKnobs {
     pub gx: f32,
@@ -273,6 +274,60 @@ pub struct LightingKnobs {
     pub awb_dx: f32,
     pub awb_dy: f32,
     pub awb_strength: f32,
+    /// Handheld phone+hand cast shadow (normalized `[0..1]` coords).
+    pub phone_cx: f32,
+    pub phone_cy: f32,
+    pub phone_hw: f32,
+    pub phone_hh: f32,
+    pub phone_cos_a: f32,
+    pub phone_sin_a: f32,
+    pub phone_penumbra: f32,
+    /// Signed strength: `|val| = strength`, sign encodes `hand_side` (`-1` left, `+1` right).
+    pub phone_strength_signed: f32,
+    /// Anisotropic glossy specular bloom (`spec_strength == 0.0` = off).
+    pub spec_sx: f32,
+    pub spec_sy: f32,
+    pub spec_inv_radius: f32,
+    pub spec_strength: f32,
+    pub spec_cos_a: f32,
+    pub spec_sin_a: f32,
+    pub spec_aspect: f32,
+    /// `1.0` enables C1 soft-shoulder highlight rolloff above 210.0; `0.0` = hard clamp.
+    pub spec_rolloff: f32,
+}
+
+impl Default for LightingKnobs {
+    fn default() -> Self {
+        Self {
+            gx: 0.0,
+            gy: 0.0,
+            glare_radius: 10.0,
+            glare_alpha: 0.0,
+            sh_dx: 1.0,
+            sh_dy: 0.0,
+            shadow_strength: 0.0,
+            vignette_strength: 0.0,
+            awb_dx: 1.0,
+            awb_dy: 0.0,
+            awb_strength: 0.0,
+            phone_cx: 0.5,
+            phone_cy: 0.8,
+            phone_hw: 0.14,
+            phone_hh: 0.20,
+            phone_cos_a: 1.0,
+            phone_sin_a: 0.0,
+            phone_penumbra: 0.06,
+            phone_strength_signed: 0.0,
+            spec_sx: 0.0,
+            spec_sy: 0.0,
+            spec_inv_radius: 0.01,
+            spec_strength: 0.0,
+            spec_cos_a: 1.0,
+            spec_sin_a: 0.0,
+            spec_aspect: 1.5,
+            spec_rolloff: 0.0,
+        }
+    }
 }
 
 /// Knobs for the stage-1 paper grain field.
@@ -300,6 +355,32 @@ pub struct BendKnobs {
     pub rip_fx: f32,
     pub rip_fy: f32,
     pub rip_ph: f32,
+    /// Overhead 3D light direction `[lx, ly, lz]` + Lambertian normal-shading strength (`0.0` = legacy).
+    pub light_lx: f32,
+    pub light_ly: f32,
+    pub light_lz: f32,
+    pub normal_strength: f32,
+}
+
+impl Default for BendKnobs {
+    fn default() -> Self {
+        Self {
+            mode: 2,
+            edge_id: 0,
+            curl_px: 0.0,
+            curl_shade: 0.0,
+            spine_cx: 0.0,
+            spine_w: 1.0,
+            depth: 0.0,
+            rip_fx: 0.0,
+            rip_fy: 0.0,
+            rip_ph: 0.0,
+            light_lx: 0.0,
+            light_ly: 0.0,
+            light_lz: 0.8,
+            normal_strength: 0.0,
+        }
+    }
 }
 
 /// Output dims of the fused rotate+downscale pass: the legacy ceil-expanded
@@ -631,7 +712,7 @@ impl GpuContext {
         result
     }
 
-    /// Apply lighting: glare + directional shadow + vignette.
+    /// Apply lighting: glare + directional shadow + vignette + AWB + phone shadow + specular bloom.
     #[allow(dead_code)]
     pub fn lighting(&self, src_host: &[f32], w: u32, h: u32, k: LightingKnobs) -> Vec<f32> {
         let wf = w as f32;
@@ -657,6 +738,22 @@ impl GpuContext {
             k.awb_dy,
             k.awb_strength,
             0.0,
+            k.phone_cx,
+            k.phone_cy,
+            k.phone_hw,
+            k.phone_hh,
+            k.phone_cos_a,
+            k.phone_sin_a,
+            k.phone_penumbra,
+            k.phone_strength_signed,
+            k.spec_sx,
+            k.spec_sy,
+            k.spec_inv_radius,
+            k.spec_strength,
+            k.spec_cos_a,
+            k.spec_sin_a,
+            k.spec_aspect,
+            k.spec_rolloff,
         ];
         run_pointwise(
             &self.device,
@@ -666,25 +763,27 @@ impl GpuContext {
             src_host,
             w,
             h,
-            prm,
+            &prm,
         )
     }
 
     /// Chromatic aberration: R/B sampled along the center radius.
     #[allow(dead_code)]
     pub fn chromatic(&self, src_host: &[f32], w: u32, h: u32, ca_px: f32) -> Vec<f32> {
+        let wf = w as f32;
+        let hf = h as f32;
         let prm = [
-            w as f32 / 2.0,
-            h as f32 / 2.0,
-            w as f32,
-            h as f32,
+            wf / 2.0,
+            hf / 2.0,
+            wf,
+            hf,
             246.0,
             243.0,
             236.0,
             ca_px,
             0.0,
-            0.0,
-            0.0,
+            1.0,
+            1.0,
             0.0,
             0.0,
             0.0,
@@ -699,7 +798,7 @@ impl GpuContext {
             src_host,
             w,
             h,
-            prm,
+            &prm,
         )
     }
 
@@ -732,7 +831,7 @@ impl GpuContext {
             src_host,
             w,
             h,
-            prm,
+            &prm,
         )
     }
 
@@ -747,15 +846,15 @@ impl GpuContext {
             k.spine_cx,
             k.spine_w,
             k.depth,
-            0.0,
+            k.light_lx,
             k.rip_fx,
             k.rip_fy,
             k.rip_ph,
-            0.0,
+            k.light_ly,
             w as f32,
             h as f32,
-            0.0,
-            0.0,
+            k.light_lz,
+            k.normal_strength,
         ];
         run_pointwise(
             &self.device,
@@ -765,7 +864,7 @@ impl GpuContext {
             src_host,
             w,
             h,
-            prm,
+            &prm,
         )
     }
 
@@ -784,7 +883,7 @@ impl GpuContext {
             src_host,
             w,
             h,
-            prm,
+            &prm,
         )
     }
 
@@ -866,7 +965,7 @@ impl GpuContext {
                                 src: &wgpu::Buffer,
                                 dst: &wgpu::Buffer,
                                 dims: [u32; 4],
-                                prm: [f32; 16]| {
+                                prm: &[f32]| {
                 let dims_buf = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -878,7 +977,7 @@ impl GpuContext {
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: None,
-                        contents: bytemuck::cast_slice(&prm),
+                        contents: bytemuck::cast_slice(prm),
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     });
                 let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -936,7 +1035,7 @@ impl GpuContext {
                     src,
                     &ping,
                     [w, h, w, h],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
@@ -952,27 +1051,35 @@ impl GpuContext {
                     b.spine_cx,
                     b.spine_w,
                     b.depth,
-                    0.0,
+                    b.light_lx,
                     b.rip_fx,
                     b.rip_fy,
                     b.rip_ph,
-                    0.0,
+                    b.light_ly,
                     w as f32,
                     h as f32,
-                    0.0,
-                    0.0,
+                    b.light_lz,
+                    b.normal_strength,
                 ];
                 let src = if head { &up } else { &pong };
-                dispatch(&self.bend_pipeline, "c-bend", src, &ping, [w, h, w, h], prm);
+                dispatch(
+                    &self.bend_pipeline,
+                    "c-bend",
+                    src,
+                    &ping,
+                    [w, h, w, h],
+                    &prm,
+                );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 3. perspective warp (same dims, paper-tone fill).
+            // 3. perspective warp (same dims, paper-tone or desk-tone fill).
             if cfg.run_persp {
                 let inv = cfg.persp_inv;
+                let pf = cfg.persp_fill;
                 let prm = [
                     inv[0], inv[1], inv[2], 0.0, inv[3], inv[4], inv[5], 0.0, inv[6], inv[7],
-                    inv[8], 0.0, 246.0, 243.0, 236.0, 0.0,
+                    inv[8], 0.0, pf[0], pf[1], pf[2], 0.0,
                 ];
                 let src = if head { &up } else { &pong };
                 dispatch(
@@ -981,7 +1088,7 @@ impl GpuContext {
                     src,
                     &ping,
                     [w, h, w, h],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
@@ -1000,13 +1107,12 @@ impl GpuContext {
                     src,
                     &ping,
                     [w, h, w2, h2],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 5. blur (+ optional in-kernel tilt blend). Uniform packing
-            // mirrors `blur()`; tilt slots carry the focus band.
+            // 5. blur (+ optional in-kernel tilt blend & Petzval field curvature).
             if cfg.run_blur {
                 let radius = (3.0 * cfg.blur_sigma).ceil().max(0.0);
                 let prm = [
@@ -1015,9 +1121,9 @@ impl GpuContext {
                     cfg.focus_y,
                     cfg.focus_h,
                     if cfg.tilt_active { 1.0 } else { 0.0 },
-                    0.0,
-                    0.0,
-                    0.0,
+                    cfg.field_curvature,
+                    cfg.ca_optical_center[0],
+                    cfg.ca_optical_center[1],
                     0.0,
                     0.0,
                     0.0,
@@ -1034,12 +1140,12 @@ impl GpuContext {
                     src,
                     &ping,
                     [w2, h2, w2, h2],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 6. lighting. Packing mirrors `lighting()`.
+            // 6. lighting (128 B uniform: glare + shadow + vig + AWB + phone shadow + specular bloom).
             if cfg.run_light {
                 let k = &cfg.light;
                 let (wf, hf) = (w2 as f32, h2 as f32);
@@ -1060,6 +1166,22 @@ impl GpuContext {
                     k.awb_dy,
                     k.awb_strength,
                     0.0,
+                    k.phone_cx,
+                    k.phone_cy,
+                    k.phone_hw,
+                    k.phone_hh,
+                    k.phone_cos_a,
+                    k.phone_sin_a,
+                    k.phone_penumbra,
+                    k.phone_strength_signed,
+                    k.spec_sx,
+                    k.spec_sy,
+                    k.spec_inv_radius,
+                    k.spec_strength,
+                    k.spec_cos_a,
+                    k.spec_sin_a,
+                    k.spec_aspect,
+                    k.spec_rolloff,
                 ];
                 let src = if head { &up } else { &pong };
                 dispatch(
@@ -1068,25 +1190,40 @@ impl GpuContext {
                     src,
                     &ping,
                     [w2, h2, w2, h2],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 7. chromatic aberration. Packing mirrors `chromatic()`.
+            // 7. chromatic aberration (legacy linear or off-axis cubic radial).
             if cfg.run_ca {
+                let wf = w2 as f32;
+                let hf = h2 as f32;
+                let (cx, cy, norm_x, norm_y, r_scale, b_scale) = if cfg.ca_cubic_weight > 0.0 {
+                    let max_r = (0.5 * wf.hypot(hf)).max(1.0);
+                    (
+                        wf * cfg.ca_optical_center[0],
+                        hf * cfg.ca_optical_center[1],
+                        max_r,
+                        max_r,
+                        0.90f32,
+                        1.15f32,
+                    )
+                } else {
+                    (wf / 2.0, hf / 2.0, wf, hf, 1.0f32, 1.0f32)
+                };
                 let prm = [
-                    w2 as f32 / 2.0,
-                    h2 as f32 / 2.0,
-                    w2 as f32,
-                    h2 as f32,
+                    cx,
+                    cy,
+                    norm_x,
+                    norm_y,
                     246.0,
                     243.0,
                     236.0,
                     cfg.ca_px,
-                    0.0,
-                    0.0,
-                    0.0,
+                    cfg.ca_cubic_weight,
+                    r_scale,
+                    b_scale,
                     0.0,
                     0.0,
                     0.0,
@@ -1094,17 +1231,24 @@ impl GpuContext {
                     0.0,
                 ];
                 let src = if head { &up } else { &pong };
-                dispatch(&self.ca_pipeline, "c-ca", src, &ping, [w2, h2, w2, h2], prm);
+                dispatch(
+                    &self.ca_pipeline,
+                    "c-ca",
+                    src,
+                    &ping,
+                    [w2, h2, w2, h2],
+                    &prm,
+                );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 8. sensor noise (read + optional Poisson shot noise). Packing mirrors `noise()`.
+            // 8. sensor noise (read + Poisson shot + 1/4-res chroma blotch).
             if cfg.run_noise {
                 let prm = [
                     cfg.noise_sigma,
                     f32::from_bits(cfg.noise_seed),
                     cfg.noise_shot_sigma,
-                    0.0,
+                    cfg.chroma_noise_sigma,
                     0.0,
                     0.0,
                     0.0,
@@ -1125,7 +1269,7 @@ impl GpuContext {
                     src,
                     &ping,
                     [w2, h2, w2, h2],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
@@ -1140,7 +1284,7 @@ impl GpuContext {
                     src,
                     &ping,
                     [w2, h2, out_w, out_h],
-                    prm,
+                    &prm,
                 );
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
@@ -1397,6 +1541,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var sx = fx;
     var sy = fy;
     var shade = 1.0;
+    var dzx = 0.0;
+    var dzy = 0.0;
+    var ao = shade;
+    let min_d = max(min(wf, hf), 1.0);
     let mode = u32(prm.a.x);
     if (mode == 0u) {
         // Book-spine gutter: smooth squeeze + shade, continuous across fold.
@@ -1404,6 +1552,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         let g = exp(-t * t);
         sx = prm.b.x + (fx - prm.b.x) * (1.0 - prm.b.z * g);
         shade = 1.0 - curl_shade * g;
+        let slope_k = clamp(prm.b.z / 0.10, 0.2, 1.8) * 1.15;
+        dzx = 2.0 * slope_k * t * g;
+        ao = 1.0 - curl_shade * 0.65 * g;
     } else if (mode == 1u) {
         // Hand-held ripple: sinusoidal offsets, mild brightness roll.
         let p1 = 6.283185307179586 * prm.c.x * fy / hf + prm.c.z;
@@ -1411,6 +1562,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         sx = fx + curl_px * 0.5 * sin(p1);
         sy = fy + curl_px * 0.3 * cos(p2);
         shade = 1.0 - curl_shade * 0.4 * abs(sin(p1));
+        let amp = clamp(curl_px / min_d * 12.0, 0.15, 1.1);
+        dzx = amp * 0.45 * cos(p2);
+        dzy = -amp * 0.75 * sin(p1);
+        ao = 1.0 - curl_shade * 0.25 * abs(sin(p1));
     } else {
         // Edge curl toward one side.
         let eid = u32(prm.a.w);
@@ -1434,6 +1589,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             sy = fy - curl_px * edge * edge * along;
         }
         shade = 1.0 - curl_shade * edge * edge;
+        let s_e = clamp(curl_px / min_d * 16.0, 0.2, 1.4) * edge * edge * along;
+        if (eid == 0u) { dzx = -s_e; }
+        else if (eid == 1u) { dzx = s_e; }
+        else if (eid == 2u) { dzy = -s_e; }
+        else { dzy = s_e; }
+        ao = 1.0 - curl_shade * 0.55 * edge * edge;
+    }
+    if (prm.d.w > 0.0) {
+        let inv_len = inverseSqrt(dzx * dzx + dzy * dzy + 1.0);
+        let ndotl = max((-dzx * prm.b.w - dzy * prm.c.w + prm.d.z) * inv_len, 0.0);
+        let diff_ratio = 0.28 + 0.72 * (ndotl / max(prm.d.z, 0.25));
+        shade = clamp(ao * mix(1.0, diff_ratio, prm.d.w), 0.35, 1.18);
     }
     let x0 = i32(floor(sx));
     let y0 = i32(floor(sy));
@@ -1484,6 +1651,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let sigma = prm.a.x;
     let seed = bitcast<u32>(prm.a.y);
     let sigma_shot = prm.a.z;
+    let chroma_sigma = prm.a.w;
     // One independent Irwin-Hall-4 Gaussian per channel (12 taps/pixel,
     // base b = 0: R taps 0-3, G taps 4-7, B taps 8-11).
     let g0 = ih4(seed, x, y, 0u);
@@ -1495,17 +1663,44 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         let luma = max((src[i] + src[i + 1u] + src[i + 2u]) / (3.0 * 255.0), 0.01);
         eff_sigma = sqrt(sigma * sigma + sigma_shot * sigma_shot * luma);
     }
-    dst[i] = clamp(src[i] + g0 * eff_sigma, 0.0, 255.0);
-    dst[i + 1u] = clamp(src[i + 1u] + g1 * eff_sigma, 0.0, 255.0);
-    dst[i + 2u] = clamp(src[i + 2u] + g2 * eff_sigma, 0.0, 255.0);
+    var cr_rgb = vec3<f32>(0.0, 0.0, 0.0);
+    if (chroma_sigma > 0.05) {
+        let gx = f32(x) * 0.25;
+        let gy = f32(y) * 0.25;
+        let x0 = u32(floor(gx));
+        let y0 = u32(floor(gy));
+        let tx = gx - f32(x0);
+        let ty = gy - f32(y0);
+        let cseed = seed ^ 0x517CC1B7u;
+        let cb00 = (pcg01(cseed, x0,      y0,      0u) + pcg01(cseed, x0,      y0,      1u) - 1.0) * 2.4494897;
+        let cb10 = (pcg01(cseed, x0 + 1u, y0,      0u) + pcg01(cseed, x0 + 1u, y0,      1u) - 1.0) * 2.4494897;
+        let cb01 = (pcg01(cseed, x0,      y0 + 1u, 0u) + pcg01(cseed, x0,      y0 + 1u, 1u) - 1.0) * 2.4494897;
+        let cb11 = (pcg01(cseed, x0 + 1u, y0 + 1u, 0u) + pcg01(cseed, x0 + 1u, y0 + 1u, 1u) - 1.0) * 2.4494897;
+        let cr00 = (pcg01(cseed, x0,      y0,      2u) + pcg01(cseed, x0,      y0,      3u) - 1.0) * 2.4494897;
+        let cr10 = (pcg01(cseed, x0 + 1u, y0,      2u) + pcg01(cseed, x0 + 1u, y0,      3u) - 1.0) * 2.4494897;
+        let cr01 = (pcg01(cseed, x0,      y0 + 1u, 2u) + pcg01(cseed, x0,      y0 + 1u, 3u) - 1.0) * 2.4494897;
+        let cr11 = (pcg01(cseed, x0 + 1u, y0 + 1u, 2u) + pcg01(cseed, x0 + 1u, y0 + 1u, 3u) - 1.0) * 2.4494897;
+        let dcb = mix(mix(cb00, cb10, tx), mix(cb01, cb11, tx), ty);
+        let dcr = mix(mix(cr00, cr10, tx), mix(cr01, cr11, tx), ty);
+        let y_norm = clamp((src[i] + src[i + 1u] + src[i + 2u]) / (3.0 * 255.0), 0.0, 1.0);
+        let sh_w = chroma_sigma * (1.0 - 0.65 * y_norm);
+        cr_rgb = vec3<f32>(
+             1.402 * dcr * sh_w,
+            (-0.344136 * dcb - 0.714136 * dcr) * sh_w,
+             1.772 * dcb * sh_w,
+        );
+    }
+    dst[i] = clamp(src[i] + g0 * eff_sigma + cr_rgb.x, 0.0, 255.0);
+    dst[i + 1u] = clamp(src[i + 1u] + g1 * eff_sigma + cr_rgb.y, 0.0, 255.0);
+    dst[i + 2u] = clamp(src[i + 2u] + g2 * eff_sigma + cr_rgb.z, 0.0, 255.0);
 }
 "#;
 
-/// Chromatic aberration: red sampled inward along the center radius,
-/// blue outward, green untouched. Uniforms: A=(cx, cy, wf, hf).
+/// Chromatic aberration: red sampled inward along the optical-center radius,
+/// blue outward, green untouched. Supports legacy linear and cubic radial CA.
 const CA_SHADER: &str = r#"
 struct Dims { src_w : u32, src_h : u32, dst_w : u32, dst_h : u32 }
-struct Ca { a : vec4<f32>, b : vec4<f32> }
+struct Ca { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
 
 @group(0) @binding(0) var<storage, read> src : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<f32>;
@@ -1539,9 +1734,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let fy = f32(y);
     let dx = (fx - prm.a.x) / max(prm.a.z, 1.0);
     let dy = (fy - prm.a.y) / max(prm.a.w, 1.0);
-    let k = prm.b.w;
-    let r = sample_at(fx - dx * k, fy - dy * k);
-    let b = sample_at(fx + dx * k, fy + dy * k);
+    let cubic = prm.c.x;
+    let r2 = min(dx * dx + dy * dy, 1.5);
+    let gain = ((1.0 - cubic) + cubic * r2) * prm.b.w;
+    let r = sample_at(fx - dx * gain * prm.c.y, fy - dy * gain * prm.c.y);
+    let b = sample_at(fx + dx * gain * prm.c.z, fy + dy * gain * prm.c.z);
     let i = (y * dims.src_w + x) * 3u;
     dst[i] = clamp(r.x, 0.0, 255.0);
     dst[i + 1u] = clamp(src[i + 1u], 0.0, 255.0);
@@ -1549,13 +1746,14 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 "#;
 
-/// Lighting: specular glare disc + directional shadow + vignette.
-/// Pointwise; ports lighting stage 5 exactly.
-/// Uniforms: A=(gx,gy,glare_radius,glare_alpha), B=(sh_dx,sh_dy,
-/// shadow_strength,vignette_strength), C=(cx,cy,diag,max_d), D unused.
+/// Lighting: specular glare disc + directional shadow + vignette + AWB +
+/// handheld phone/hand cast shadow + anisotropic specular bloom + soft rolloff.
 const LIGHTING_SHADER: &str = r#"
 struct Dims { src_w : u32, src_h : u32, dst_w : u32, dst_h : u32 }
-struct Lit { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
+struct Lit {
+    a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32>,
+    e : vec4<f32>, f : vec4<f32>, g : vec4<f32>, h : vec4<f32>,
+}
 
 @group(0) @binding(0) var<storage, read> src : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<f32>;
@@ -1592,10 +1790,56 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         mg = m * (1.0 + 0.02 * awb);
         mb = m * (1.0 - 0.16 * awb);
     }
+    let ps_s = abs(prm.f.w);
+    if (ps_s > 0.0) {
+        let hand_side = select(-1.0, 1.0, prm.f.w >= 0.0);
+        let u = fx / max(prm.c.x * 2.0, 1.0);
+        let v = fy / max(prm.c.y * 2.0, 1.0);
+        let pdx = u - prm.e.x;
+        let pdy = v - prm.e.y;
+        let lx = pdx * prm.f.x + pdy * prm.f.y;
+        let ly = -pdx * prm.f.y + pdy * prm.f.x;
+        let q = abs(vec2<f32>(lx, ly)) - vec2<f32>(prm.e.z - 0.025, prm.e.w - 0.025);
+        let d_phone = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - 0.025;
+        let a_pt = vec2<f32>(hand_side * prm.e.z * 0.85, prm.e.w * 0.15);
+        let b_pt = vec2<f32>(hand_side * (prm.e.z + 0.24), prm.e.w + 0.35);
+        let pa = vec2<f32>(lx, ly) - a_pt;
+        let ba = b_pt - a_pt;
+        let h_seg = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+        let d_hand = length(pa - ba * h_seg) - (0.095 + 0.045 * h_seg);
+        let sm = max(0.045 - abs(d_phone - d_hand), 0.0) / 0.045;
+        let d_sdf = min(d_phone, d_hand) - sm * sm * 0.01125;
+        let z = 1.8 * d_sdf / max(prm.f.z, 1e-4);
+        let occ = 0.5 * (1.0 - z * inverseSqrt(1.0 + z * z));
+        mr *= (1.0 - ps_s * occ * 1.08);
+        mg *= (1.0 - ps_s * occ * 1.00);
+        mb *= (1.0 - ps_s * occ * 0.86);
+    }
+    var sp = 0.0;
+    if (prm.g.w > 0.0) {
+        let sdx = fx - prm.g.x;
+        let sdy = fy - prm.g.y;
+        let su = (sdx * prm.h.x + sdy * prm.h.y) * prm.g.z;
+        let sv = (-sdx * prm.h.y + sdy * prm.h.x) * prm.g.z * prm.h.z;
+        let d2 = su * su + sv * sv;
+        let kc = 1.0 / (1.0 + 4.5 * d2);
+        sp = prm.g.w * 255.0 * (0.72 * kc * kc + 0.28 / (1.0 + 0.65 * d2));
+    }
     let i = (y * dims.src_w + x) * 3u;
-    dst[i] = clamp(src[i] * mr + add, 0.0, 255.0);
-    dst[i + 1u] = clamp(src[i + 1u] * mg + add, 0.0, 255.0);
-    dst[i + 2u] = clamp(src[i + 2u] * mb + add, 0.0, 255.0);
+    let raw = vec3<f32>(
+        src[i] * mr + add + sp,
+        src[i + 1u] * mg + add + sp * 0.98,
+        src[i + 2u] * mb + add + sp * 0.93,
+    );
+    var out = clamp(raw, vec3<f32>(0.0), vec3<f32>(255.0));
+    if (prm.h.w > 0.5) {
+        let ex = max(raw - vec3<f32>(210.0), vec3<f32>(0.0));
+        let rolled = vec3<f32>(210.0) + 45.0 * ex / (vec3<f32>(45.0) + ex);
+        out = clamp(select(raw, rolled, raw > vec3<f32>(210.0)), vec3<f32>(0.0), vec3<f32>(255.0));
+    }
+    dst[i] = out.x;
+    dst[i + 1u] = out.y;
+    dst[i + 2u] = out.z;
 }
 "#;
 
@@ -1783,6 +2027,7 @@ mod tests {
             rip_fx: 1.5,
             rip_fy: 1.2,
             rip_ph: 0.7,
+            ..BendKnobs::default()
         }
     }
 
@@ -2057,19 +2302,7 @@ mod tests {
         };
         let (w, h) = (64, 48);
         let src = gradient(w, h);
-        let zero = LightingKnobs {
-            gx: 0.0,
-            gy: 0.0,
-            glare_radius: 10.0,
-            glare_alpha: 0.0,
-            sh_dx: 1.0,
-            sh_dy: 0.0,
-            shadow_strength: 0.0,
-            vignette_strength: 0.0,
-            awb_dx: 1.0,
-            awb_dy: 0.0,
-            awb_strength: 0.0,
-        };
+        let zero = LightingKnobs::default();
         let gpu = ctx.lighting(&src, w, h, zero);
         assert!(
             max_abs(&gpu, &src) == 0.0,
@@ -2095,9 +2328,7 @@ mod tests {
             sh_dy: th.sin(),
             shadow_strength: 0.24,
             vignette_strength: 0.1,
-            awb_dx: 1.0,
-            awb_dy: 0.0,
-            awb_strength: 0.0,
+            ..LightingKnobs::default()
         };
         let gpu = ctx.lighting(&src, w, h, k);
         let cpu = cpu_lighting(&src, w, h, k);
@@ -2146,9 +2377,7 @@ mod tests {
                 sh_dy: th.sin(),
                 shadow_strength: 0.24,
                 vignette_strength: 0.1,
-                awb_dx: 1.0,
-                awb_dy: 0.0,
-                awb_strength: 0.0,
+                ..LightingKnobs::default()
             },
             ca_px: 0.8,
             noise_sigma: 6.0,

@@ -15,14 +15,14 @@ Two-crate Cargo workspace (`resolver = "2"`, Rust 2021, `MIT OR Apache-2.0`). `d
 | `crates/doc-photo-degrade/src/main.rs` | Multi-threaded `doc-photo-degrade` CLI driver, profile/preset flag parsing, shared GPU warmup |
 | `crates/doc-photo-degrade/src/degrader.rs` | Ergonomic `Degrader` / `DegraderBuilder`, 7 `DocumentProfile` presets, `DegradeError`, parallel `degrade_batch` |
 | `crates/doc-photo-degrade/src/reproject.rs` | Exact non-linear bend + projective forward/backward coordinate reprojection (`< 0.2 px` rendered error) |
-| `crates/doc-photo-degrade/src/masks.rs` | Multi-task GT mask export (`uv_flow`, `illumination`, `clean_ink`, `artifacts` bitmask, `.npy` v1.0 & `png16`) |
-| `crates/doc-photo-degrade/src/realism.rs` | Wave 2 photorealism (`RealismConfig`, mixed-illuminant AWB, USM haloing, procedural desk + contact shadow, 3D paper crumple shading, sheet-protector sheen) |
-| `crates/doc-photo-degrade/src/geometry.rs` | Margin-safe `content_bbox`, `quiet_margins`, crop/pad framing, homography, tear-free `spine_map`, `ink_grid` |
-| `crates/doc-photo-degrade/src/paper.rs` | Paper aging (yellowing, mottling, foxing spots, fibers, cockling, water damage) |
-| `crates/doc-photo-degrade/src/ink.rs` | Ink wear (fading, dropout, broken strokes, bleed-through, toner variation) |
-| `crates/doc-photo-degrade/src/wear.rs` | Heavy wear (washout, printer banding, streaks, misregistration, eraser smudges, stains) |
-| `crates/doc-photo-degrade/src/capture.rs` | Capture/handling defects (exposure, sensor banding, motion blur, tape, punch holes) |
-| `crates/doc-photo-degrade/src/banks.rs` | Seeded 256×256 tiled Gaussian banks and precomputed lighting/stamp fields (`--fast-banks`) |
+| `crates/doc-photo-degrade/src/masks.rs` | Multi-task GT mask export (`uv_flow`, `illumination`, `clean_ink`, 14-bit `artifacts` bitmask, `.npy` v1.0 & `png16`) |
+| `crates/doc-photo-degrade/src/realism.rs` | Wave 2 & 3 photorealism (`RealismConfig`, phone+hand shadow, anisotropic specular bloom, filmic tone LUT, 1/4-res chroma noise, fused 3D cockle/tooth/plate-mark/gutter micro-relief, edge-aware HDR USM, scanner lid bar + CCD lines, `DeskLut` + exact 2-Quad SDF desk/contact shadow, margin-safe fingertip/binder-clip/stand-ledge occluders) |
+| `crates/doc-photo-degrade/src/geometry.rs` | Margin-safe `content_bbox`, `quiet_margins`, independent per-corner detachment (`CornerDetachConfig`, `QuadSdf2D`, `compute_detached_corners`), crop/pad framing, homography, tear-free `spine_map`, stride-2/4 `ink_grid` |
+| `crates/doc-photo-degrade/src/paper.rs` | Paper aging, `PaperStock` micro-surface BRDF & capillary ink spread, Y-sorted curved Bezier cellulose fibers / pulp flecks / lint, archival edge-oxidation LUT / ferric foxing / corner finger-oil / watermark |
+| `crates/doc-photo-degrade/src/ink.rs` | Ink wear (fading, dropout, broken strokes, bleed-through, toner variation), thermal receipt fade/scratches, ink-only micro-texture/halftone |
+| `crates/doc-photo-degrade/src/wear.rs` | Heavy wear (washout, printer banding, streaks, misregistration, eraser smudges, stains, 8×8 tile-skipped Xerox fuser drum ghosting) |
+| `crates/doc-photo-degrade/src/capture.rs` | Capture/handling defects (exposure, sensor banding, motion blur, serrated translucent scotch tape v2, desk-through binder punch holes) |
+| `crates/doc-photo-degrade/src/banks.rs` | Seeded 256×256 tiled Gaussian/weave/tooth banks, capillary coffee-stain precompute, and precomputed lighting/stamp fields (`--fast-banks`) |
 | `crates/doc-photo-degrade/src/codecs.rs` | SIMD `zune-png` / `zune-jpeg` decode, `jpeg-encoder`, `fast_image_resize`, atomic `write_artifact` |
 | `crates/doc-photo-degrade/src/gpu_backend.rs` | Feature-gated (`gpu`) wrapper holding `Mutex<GpuContext>` and two-segment resident chain dispatch |
 | `crates/doc-photo-degrade-gpu/src/lib.rs` | Public re-exports for the standalone WGPU compute crate (`doc_photo_degrade_gpu`) |

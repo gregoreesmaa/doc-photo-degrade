@@ -40,6 +40,12 @@ pub mod artifact_bits {
     pub const STICKY_NOTE: u16 = 1 << 9;
     /// Fingertip oil smudge / ridge print.
     pub const FINGERPRINT: u16 = 1 << 10;
+    /// Soft-focus fingertip / thumb holding the outer page margin.
+    pub const FINGER: u16 = 1 << 11;
+    /// Metal binder clip clamping the outer page edge.
+    pub const BINDER_CLIP: u16 = 1 << 12;
+    /// Music-stand bottom lip / ledge occluding the outer bottom margin.
+    pub const STAND_LEDGE: u16 = 1 << 13;
 }
 
 /// Controls which ground-truth supervision masks are generated alongside the

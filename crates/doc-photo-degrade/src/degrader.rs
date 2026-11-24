@@ -24,6 +24,9 @@ use std::str::FromStr;
 
 use image::RgbImage;
 
+use crate::banks::PaperWeaveProfile;
+use crate::geometry::CornerDetachConfig;
+use crate::paper::{PaperStock, PulpInclusionConfig};
 use crate::{
     BackendPreference, DegradeConfig, DegradeResult, MaskRequest, Preset, RealismConfig,
     StageToggles,
@@ -172,6 +175,7 @@ impl DocumentProfile {
                 cfg.jpeg_quality = None;
                 cfg.toggles = StageToggles::full();
                 cfg.realism = RealismConfig::phone();
+                cfg.corner_detach = CornerDetachConfig::phone();
             }
             DocumentProfile::ArchivalManuscript => {
                 cfg.strength = 0.75;
@@ -187,13 +191,19 @@ impl DocumentProfile {
                     fast_banks,
                 };
                 cfg.realism = RealismConfig {
-                    enable_awb: true,
-                    enable_shot_noise: true,
                     enable_usm: false,
-                    enable_desk_surface: true,
-                    enable_crumple: true,
                     enable_sheen: false,
+                    enable_specular_bloom: false,
+                    enable_double_jpeg: false,
+                    paper_weave: PaperWeaveProfile::archival(),
+                    pulp_inclusions: PulpInclusionConfig::archival(),
+                    paper_stock: PaperStock::UncoatedRag,
+                    allow_ink_spread: true,
+                    archival_paper_scale: 1.0,
+                    enable_plate_mark: true,
+                    ..RealismConfig::phone()
                 };
+                cfg.corner_detach = CornerDetachConfig::phone();
             }
             DocumentProfile::ThermalReceipt => {
                 cfg.strength = 0.70;
@@ -209,13 +219,20 @@ impl DocumentProfile {
                     fast_banks,
                 };
                 cfg.realism = RealismConfig {
-                    enable_awb: true,
-                    enable_shot_noise: true,
-                    enable_usm: true,
-                    enable_desk_surface: true,
-                    enable_crumple: true,
-                    enable_sheen: false,
+                    enable_sheen: true,
+                    enable_thermal_physics: true,
+                    paper_weave: PaperWeaveProfile::smooth(),
+                    pulp_inclusions: PulpInclusionConfig::thermal(),
+                    paper_stock: PaperStock::ThermalReceipt,
+                    allow_ink_spread: false,
+                    archival_paper_scale: 0.0,
+                    enable_cockle_relief: false,
+                    enable_tooth_bump: false,
+                    enable_plate_mark: false,
+                    enable_gutter_emboss: false,
+                    ..RealismConfig::phone()
                 };
+                cfg.corner_detach = CornerDetachConfig::phone();
             }
             DocumentProfile::OfficeScan => {
                 cfg.strength = 0.20;
@@ -231,6 +248,7 @@ impl DocumentProfile {
                     fast_banks,
                 };
                 cfg.realism = RealismConfig::flat_scanner();
+                cfg.corner_detach = CornerDetachConfig::disabled();
             }
             DocumentProfile::PhotocopyXerox => {
                 cfg.strength = 0.65;
@@ -245,7 +263,15 @@ impl DocumentProfile {
                     coarsen_aging: true,
                     fast_banks,
                 };
-                cfg.realism = RealismConfig::flat_scanner();
+                cfg.realism = RealismConfig {
+                    enable_drum_ghost: true,
+                    enable_scanner_bar: true,
+                    xerox_heavy: true,
+                    paper_weave: PaperWeaveProfile::photocopy(),
+                    pulp_inclusions: PulpInclusionConfig::photocopy(),
+                    ..RealismConfig::flat_scanner()
+                };
+                cfg.corner_detach = CornerDetachConfig::disabled();
             }
             DocumentProfile::BookGutterBend => {
                 cfg.strength = 0.60;
@@ -253,13 +279,16 @@ impl DocumentProfile {
                 cfg.jpeg_quality = None;
                 cfg.toggles = StageToggles::full();
                 cfg.realism = RealismConfig {
-                    enable_awb: true,
-                    enable_shot_noise: true,
-                    enable_usm: true,
-                    enable_desk_surface: true,
-                    enable_crumple: true,
                     enable_sheen: false,
+                    paper_weave: PaperWeaveProfile::book_gutter(),
+                    pulp_inclusions: PulpInclusionConfig::book_gutter(),
+                    paper_stock: PaperStock::PorousNewsprint,
+                    allow_ink_spread: true,
+                    archival_paper_scale: 0.75,
+                    enable_gutter_emboss: true,
+                    ..RealismConfig::phone()
                 };
+                cfg.corner_detach = CornerDetachConfig::phone();
             }
             DocumentProfile::SheetMusic => {
                 cfg.strength = 0.45;
@@ -274,7 +303,17 @@ impl DocumentProfile {
                     coarsen_aging: false,
                     fast_banks,
                 };
-                cfg.realism = RealismConfig::phone();
+                cfg.realism = RealismConfig {
+                    paper_weave: PaperWeaveProfile::sheet_music(),
+                    pulp_inclusions: PulpInclusionConfig::sheet_music(),
+                    paper_stock: PaperStock::UncoatedRag,
+                    allow_ink_spread: false,
+                    archival_paper_scale: 0.65,
+                    enable_plate_mark: true,
+                    enable_stand_ledge: true,
+                    ..RealismConfig::phone()
+                };
+                cfg.corner_detach = CornerDetachConfig::phone();
             }
         }
         cfg.toggles.fast_banks = fast_banks;
@@ -440,6 +479,9 @@ pub struct DegraderBuilder {
     toggles: Option<StageToggles>,
     fast_banks: Option<bool>,
     masks: MaskRequest,
+    corner_detach: Option<CornerDetachConfig>,
+    corner_inset_prob: Option<f32>,
+    paper_stock: Option<PaperStock>,
 }
 
 impl Default for DegraderBuilder {
@@ -457,6 +499,9 @@ impl Default for DegraderBuilder {
             toggles: None,
             fast_banks: None,
             masks: MaskRequest::none(),
+            corner_detach: None,
+            corner_inset_prob: None,
+            paper_stock: None,
         }
     }
 }
@@ -535,6 +580,24 @@ impl DegraderBuilder {
         self
     }
 
+    /// Override independent per-corner detachment settings.
+    pub fn corner_detach(mut self, cfg: CornerDetachConfig) -> Self {
+        self.corner_detach = Some(cfg);
+        self
+    }
+
+    /// Override the per-corner `"inset"` probability in `[0.0, 1.0]`.
+    pub fn corner_detach_inset_prob(mut self, prob: f32) -> Self {
+        self.corner_inset_prob = Some(prob);
+        self
+    }
+
+    /// Override the physical [`PaperStock`] micro-surface BRDF.
+    pub fn paper_stock(mut self, stock: PaperStock) -> Self {
+        self.paper_stock = Some(stock);
+        self
+    }
+
     /// Validate configuration, initialize the requested backend, and construct a [`Degrader`].
     pub fn build(self) -> Result<Degrader, DegradeError> {
         let mut cfg = DegradeConfig {
@@ -567,6 +630,15 @@ impl DegraderBuilder {
         }
         if let Some(fb) = self.fast_banks {
             cfg.toggles.fast_banks = fb;
+        }
+        if let Some(cd) = self.corner_detach {
+            cfg.corner_detach = cd;
+        }
+        if let Some(p) = self.corner_inset_prob {
+            cfg.corner_detach.inset_prob = p.clamp(0.0, 1.0);
+        }
+        if let Some(stock) = self.paper_stock {
+            cfg.realism.paper_stock = stock;
         }
 
         // Validate config fields with structured errors.

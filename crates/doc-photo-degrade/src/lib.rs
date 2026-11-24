@@ -55,15 +55,18 @@ pub mod realism;
 pub mod reproject;
 pub mod wear;
 
+pub use banks::{PaperWeaveProfile, WeaveStock};
 pub use capture::CaptureParams;
 pub use codecs::{collect_inputs, decode_image, encode_jpeg, write_artifact};
 pub use degrader::{DegradeError, Degrader, DegraderBuilder, DocumentProfile};
-pub use geometry::{content_bbox, content_bbox_thresh, margin_safe_crop, quiet_margins};
+pub use geometry::{
+    content_bbox, content_bbox_thresh, margin_safe_crop, quiet_margins, CornerDetachConfig,
+};
 #[cfg(feature = "gpu")]
 pub use gpu_backend::Gpu;
 pub use ink::InkParams;
 pub use masks::{artifact_bits, DegradeMasks, MaskFormat, MaskRequest};
-pub use paper::PaperParams;
+pub use paper::{PaperParams, PaperStock, PulpInclusionConfig, SurfaceBrdfParams};
 pub use realism::RealismConfig;
 pub use reproject::{
     bend_backward, bend_forward_exact, transform_bbox, transform_bbox_exact, transform_point_exact,
@@ -73,10 +76,14 @@ pub use wear::WearParams;
 
 pub(crate) use geometry::sample_bilinear;
 
-use codecs::{decode_jpeg_bytes, encode_jpeg_bytes, resize_rgb_fir, vec_to_image};
+use codecs::{
+    decode_jpeg_bytes, encode_jpeg_bytes, jpeg_roundtrip_shifted, resize_rgb_fir, vec_to_image,
+    vec_to_image_with_lut,
+};
 use geometry::{
-    apply_framing_eager, apply_h, blend_px, framed_dims, ink_grid, invert_3x3, pick_quiet_cell,
-    sample_remapped, solve_homography, spine_map, stroke, BBoxAcc,
+    apply_framing_eager, apply_h, blend_px, compute_detached_corners, framed_dims, ink_grid,
+    invert_3x3, pick_quiet_cell, sample_bilinear_fill, sample_remapped, solve_homography,
+    spine_map, stroke, BBoxAcc, DESK_BG, PAPER_BG,
 };
 use image::RgbImage;
 use rand::{Rng, SeedableRng};
@@ -211,8 +218,10 @@ pub struct DegradeConfig {
     pub scale_min: f32,
     /// Per-stage skip/coarsen toggles and fast-bank switch.
     pub toggles: StageToggles,
-    /// Wave 2 photorealism toggles (calibrated per [`DocumentProfile`]).
+    /// Wave 2 & Wave 3 photorealism toggles (calibrated per [`DocumentProfile`]).
     pub realism: RealismConfig,
+    /// Independent per-corner detachment from image edges (default: enabled for phone captures).
+    pub corner_detach: CornerDetachConfig,
     /// Optional multi-task ground-truth mask export (default: [`MaskRequest::none()`],
     /// zero overhead when disabled).
     pub masks: MaskRequest,
@@ -229,6 +238,7 @@ impl Default for DegradeConfig {
             scale_min: 0.5,
             toggles: StageToggles::default(),
             realism: RealismConfig::default(),
+            corner_detach: CornerDetachConfig::default(),
             masks: MaskRequest::none(),
         }
     }
@@ -248,7 +258,10 @@ impl DegradeConfig {
     pub fn with_preset(mut self, preset: Preset) -> Self {
         match preset {
             Preset::Full => self.toggles = StageToggles::full(),
-            Preset::Reduced => self.toggles = StageToggles::reduced(),
+            Preset::Reduced => {
+                self.toggles = StageToggles::reduced();
+                self.realism = RealismConfig::reduced();
+            }
             Preset::Custom => {}
         }
         self
@@ -282,7 +295,7 @@ pub struct DegradeResult {
 
 /// Every sampled degradation parameter, written alongside degraded images as a
 /// JSON sidecar.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct DegradeParams {
     pub input: String,
     pub output: String,
@@ -393,6 +406,163 @@ pub struct DegradeParams {
     /// Plastic sheet-protector diagonal specular sheen strength (`0.0` = off).
     #[serde(default)]
     pub sheen_strength: f32,
+
+    // --- Wave 3 (v0.3.0) backward-compatible fields (all #[serde(default)]) ---
+    /// Independent per-corner detachment offsets `[dx, dy]` in working-image px (`[TL, TR, BR, BL]`).
+    #[serde(default)]
+    pub corner_detach_px: [[f32; 2]; 4],
+    /// Independent per-corner detachment mode (`"inset"` | `"offset"` | `""` when legacy).
+    #[serde(default)]
+    pub corner_detach_modes: [String; 4],
+    /// Paper micro-weave substrate (`"none"`, `"laid"`, `"wove"`, `"cold_press"`).
+    #[serde(default)]
+    pub paper_weave_stock: String,
+    #[serde(default)]
+    pub paper_weave_strength: f32,
+    #[serde(default)]
+    pub paper_laid_wire_px: f32,
+    #[serde(default)]
+    pub paper_laid_chain_px: f32,
+    #[serde(default)]
+    pub paper_wove_anisotropy: f32,
+    #[serde(default)]
+    pub paper_tooth_light_deg: f32,
+    /// Pulp inclusions: curved cellulose fibers, rag threads, recycled flecks, lint & dust.
+    #[serde(default)]
+    pub cellulose_fiber_count: u32,
+    #[serde(default)]
+    pub cellulose_fiber_opacity: f32,
+    #[serde(default)]
+    pub rag_thread_count: u32,
+    #[serde(default)]
+    pub pulp_fleck_count: u32,
+    #[serde(default)]
+    pub surface_lint_count: u32,
+    #[serde(default)]
+    pub dust_mote_count: u32,
+    /// Archival chemical paper aging (edge oxidation, ferric foxing, corner finger-oil, watermark).
+    #[serde(default)]
+    pub edge_oxidation_strength: f32,
+    #[serde(default)]
+    pub edge_oxidation_depths: [f32; 4],
+    #[serde(default)]
+    pub foxing_cluster_count: u32,
+    #[serde(default)]
+    pub foxing_halo_strength: f32,
+    #[serde(default)]
+    pub grease_patch_count: u32,
+    #[serde(default)]
+    pub grease_patch_strength: f32,
+    #[serde(default)]
+    pub watermark_style: String,
+    #[serde(default)]
+    pub watermark_strength: f32,
+    /// Micro-surface paper BRDF stock & key optical parameters.
+    #[serde(default)]
+    pub paper_stock: String,
+    #[serde(default)]
+    pub brdf_albedo_ceil: f32,
+    #[serde(default)]
+    pub brdf_black_floor: f32,
+    #[serde(default)]
+    pub brdf_oba_strength: f32,
+    #[serde(default)]
+    pub brdf_spec_gain: f32,
+    #[serde(default)]
+    pub brdf_ink_spread: f32,
+    /// 3D paper cockling, tooth bump, raking light, plate-mark & gutter emboss.
+    #[serde(default)]
+    pub cockle_relief_strength: f32,
+    #[serde(default)]
+    pub tooth_bump_strength: f32,
+    #[serde(default)]
+    pub raking_light_angle_deg: f32,
+    #[serde(default)]
+    pub raking_elevation_deg: f32,
+    #[serde(default)]
+    pub plate_mark_strength: f32,
+    #[serde(default)]
+    pub plate_mark_inset: [f32; 2],
+    #[serde(default)]
+    pub gutter_emboss_strength: f32,
+    /// Camera optics, handheld phone shadow, bend normals, specular bloom, ISP tone & chroma.
+    #[serde(default)]
+    pub phone_shadow_strength: f32,
+    #[serde(default)]
+    pub phone_shadow_center: [f32; 2],
+    #[serde(default)]
+    pub phone_shadow_angle_deg: f32,
+    #[serde(default)]
+    pub phone_shadow_penumbra: f32,
+    #[serde(default)]
+    pub bend_normal_strength: f32,
+    #[serde(default)]
+    pub bend_light_vec: [f32; 3],
+    #[serde(default)]
+    pub ca_optical_center: [f32; 2],
+    #[serde(default)]
+    pub ca_cubic_weight: f32,
+    #[serde(default)]
+    pub field_curvature: f32,
+    #[serde(default)]
+    pub specular_bloom_strength: f32,
+    #[serde(default)]
+    pub specular_bloom_center: [f32; 2],
+    #[serde(default)]
+    pub specular_bloom_radius: f32,
+    #[serde(default)]
+    pub specular_bloom_aspect: f32,
+    #[serde(default)]
+    pub specular_bloom_angle_deg: f32,
+    #[serde(default)]
+    pub tone_black_lift: f32,
+    #[serde(default)]
+    pub tone_white_ceil: f32,
+    #[serde(default)]
+    pub tone_contrast: f32,
+    #[serde(default)]
+    pub chroma_noise_sigma: f32,
+    #[serde(default)]
+    pub hdr_shadow_boost: f32,
+    #[serde(default)]
+    pub double_jpeg_q1: u8,
+    /// Physical marks, medium physics & environment.
+    #[serde(default)]
+    pub stain_ink_bleed: f32,
+    #[serde(default)]
+    pub crease_crack_strength: f32,
+    #[serde(default)]
+    pub drum_ghost_period_px: u32,
+    #[serde(default)]
+    pub drum_ghost_alpha: f32,
+    #[serde(default)]
+    pub thermal_fade: f32,
+    #[serde(default)]
+    pub thermal_tone: String,
+    #[serde(default)]
+    pub thermal_scratches: u32,
+    #[serde(default)]
+    pub scanner_edge_mask: u8,
+    #[serde(default)]
+    pub scanner_edge_width_px: u32,
+    #[serde(default)]
+    pub ccd_dust_lines: u32,
+    #[serde(default)]
+    pub ink_micro_grain_sigma: f32,
+    #[serde(default)]
+    pub ink_edge_feather_amp: f32,
+    #[serde(default)]
+    pub ink_halftone_amp: f32,
+    #[serde(default)]
+    pub stand_ledge_px: u32,
+    #[serde(default)]
+    pub edge_occluder_kind: String,
+    #[serde(default)]
+    pub edge_occluder_edge: u8,
+    #[serde(default)]
+    pub edge_occluder_pen_px: f32,
+    #[serde(default)]
+    pub tape_style: String,
 }
 
 /// Degrade an in-memory `RgbImage` on the CPU backend.
@@ -513,11 +683,19 @@ fn degrade_image_inner(
         };
     }
 
-    // Working buffer in 0..=255 floats, RGB interleaved.
-    let mut buf: Vec<f32> = img
-        .pixels()
-        .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-        .collect();
+    // Working buffer in 0..=255 floats, RGB interleaved, plus clean content bbox
+    // measured before paper/BRDF/ink/bend/archival darkening or fading.
+    let warp_thresh3 = if rescale_k < 1.0 { 600.0 } else { 384.0 };
+    let mut clean_bbox_acc = BBoxAcc::default();
+    let mut buf: Vec<f32> = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for (x, y, p) in img.enumerate_pixels() {
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        buf.push(r);
+        buf.push(g);
+        buf.push(b);
+        clean_bbox_acc.fold(r + g + b, x, y, warp_thresh3);
+    }
+    let clean_content_bbox = clean_bbox_acc.bbox();
 
     // Optional pre-degrade clean luma snapshot for `clean_ink` mask (zero alloc when off).
     let clean_luma: Option<Vec<f32>> = if cfg.masks.clean_ink {
@@ -607,6 +785,17 @@ fn degrade_image_inner(
 
     tick!("paper-grain");
 
+    // --- 1a.5. laid / wove / cold-press 256×256 seamless micro-weave bank ---
+    let weave_s = banks::apply_paper_weave(
+        &mut buf,
+        w,
+        h,
+        file_seed,
+        s,
+        rescale_k,
+        &cfg.realism.paper_weave,
+    );
+
     // --- 1b. paper aging (foxing, mottling, fibers, water damage) ---
     let paper_p = paper::apply_with(
         &mut buf,
@@ -618,14 +807,82 @@ fn degrade_image_inner(
         rescale_k,
     );
 
+    // --- 1b2. micro-surface paper BRDF base (albedo, Dmax, OBA, velvet, absorbance) ---
+    let brdf_p = paper::SurfaceBrdfParams::sample(
+        cfg.realism.paper_stock,
+        file_seed,
+        s,
+        cfg.realism.allow_ink_spread,
+    );
+    paper::apply_surface_brdf_base(&mut buf, w, h, file_seed, &brdf_p);
+
+    // --- 1b3. Y-sorted curved cellulose fibers, recycled pulp flecks & lint ---
+    let pulp_out = paper::apply_pulp_inclusions(
+        &mut buf,
+        w,
+        h,
+        file_seed,
+        s,
+        rescale_k,
+        &cfg.realism.pulp_inclusions,
+    );
+
     tick!("paper-aging");
 
     // --- 1c. ink & print degradation (fading, dropout, bleed-through) ---
     let ink_p = ink::apply_with(&mut buf, w, h, &mut rng, s, toggles.coarsen_ink, rescale_k);
 
+    // --- 1c2. thermal receipt physics + ink micro-texture + porous ink spread ---
+    let (thermal_fade, thermal_tone, thermal_scratches) = if cfg.realism.enable_thermal_physics {
+        ink::apply_thermal_physics(&mut buf, w, h, &mut rng, s, rescale_k)
+    } else {
+        (0.0, "none".to_string(), 0)
+    };
+    let (ink_micro_grain_sigma, ink_edge_feather_amp, ink_halftone_amp) =
+        if cfg.realism.enable_ink_micro_tex && s > 0.05 {
+            let g_sig = s * if cfg.realism.xerox_heavy {
+                rng.gen_range(12.0..20.0)
+            } else {
+                rng.gen_range(4.0..10.0)
+            };
+            let f_amp = s * if cfg.realism.archival_paper_scale >= 0.8 {
+                rng.gen_range(14.0..24.0)
+            } else {
+                rng.gen_range(5.0..12.0)
+            };
+            let h_amp = if cfg.realism.xerox_heavy {
+                s * rng.gen_range(14.0..24.0)
+            } else {
+                0.0
+            };
+            ink::apply_ink_micro_texture(&mut buf, w, h, file_seed, g_sig, f_amp, h_amp);
+            (g_sig, f_amp, h_amp)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+    if brdf_p.ink_spread > 0.01 {
+        paper::apply_porous_ink_spread(&mut buf, w, h, brdf_p.ink_spread);
+    }
+
+    // --- 1d. archival chemical aging (edge oxidation LUT, ferric foxing, grease, watermark) ---
+    let archival_p = paper::apply_archival_paper(
+        &mut buf,
+        w,
+        h,
+        &mut rng,
+        s,
+        cfg.realism.archival_paper_scale,
+        toggles.coarsen_aging,
+        rescale_k,
+    );
+
     tick!("ink");
 
-    // --- 2. page bend: edge curl (any side), book spine, or ripple ---
+    // Pre-bend content bbox from clean input (immune to paper/BRDF/archival/bend shading).
+    let use_detached = cfg.corner_detach.enabled && s > 0.05 && w > 4 && h > 4;
+    let pre_bend_bbox = clean_content_bbox;
+
+    // --- 2. page bend: edge curl (any side), book spine, or ripple + 3D bend normals ---
     let bend_roll: f32 = rng.gen();
     let bend_mode: &str = if bend_roll < 0.45 {
         "edge"
@@ -648,8 +905,21 @@ fn degrade_image_inner(
     let (mut bend_spine_cx, mut bend_spine_w) = (0.0f32, 0.0f32);
     let (mut bend_ripple_fx, mut bend_ripple_fy, mut bend_ripple_ph) = (0.0f32, 0.0f32, 0.0f32);
     let bend_active = !toggles.skip_bend && curl_px > 0.25;
+    let (bend_lx, bend_ly, bend_lz, bend_normal_strength) =
+        if bend_active && cfg.realism.enable_bend_normals {
+            let az = rng.gen_range(0.0..std::f32::consts::TAU);
+            let lz = rng.gen_range(0.55..0.88f32);
+            let xy = (1.0 - lz * lz).max(0.0).sqrt();
+            (
+                xy * az.cos(),
+                xy * az.sin(),
+                lz,
+                rng.gen_range(0.55..0.92f32),
+            )
+        } else {
+            (0.0, 0.0, 0.8, 0.0)
+        };
     let mut warp_acc = BBoxAcc::default();
-    let warp_thresh3 = if rescale_k < 1.0 { 600.0 } else { 384.0 };
     #[cfg(feature = "gpu")]
     let (bend_mode_id, bend_edge_id) = if bend_mode == "spine" {
         (0u32, 0u32)
@@ -679,27 +949,39 @@ fn degrade_image_inner(
         let spine_w = bend_spine_w;
         if !use_gpu {
             let src = buf.clone();
+            let min_d = wf.min(hf).max(1.0);
             for y in 0..h {
                 let wave = 0.6 + 0.4 * ((std::f32::consts::PI * y as f32 / hf).sin());
                 for x in 0..w {
-                    let (sx, sy, shade) = if bend_mode == "spine" {
+                    let (sx, sy, mut shade, dzx, dzy, ao) = if bend_mode == "spine" {
                         let depth = ((curl_px / wf) * 2.0).min(0.15);
-                        let (sx, shade) = spine_map(x as f32, spine_cx, spine_w, depth, curl_shade);
-                        (sx, y as f32, shade)
+                        let t = (x as f32 - spine_cx) / spine_w.max(1.0);
+                        let g = (-t * t).exp();
+                        let (sx, sh) = spine_map(x as f32, spine_cx, spine_w, depth, curl_shade);
+                        let slope_k = (depth / 0.10).clamp(0.2, 1.8) * 1.15;
+                        (
+                            sx,
+                            y as f32,
+                            sh,
+                            2.0 * slope_k * t * g,
+                            0.0,
+                            1.0 - curl_shade * 0.65 * g,
+                        )
                     } else if bend_mode == "ripple" {
-                        let ox = curl_px
-                            * 0.5
-                            * (std::f32::consts::TAU * ripple_fx * y as f32 / hf + ripple_ph).sin();
-                        let oy = curl_px
-                            * 0.3
-                            * (std::f32::consts::TAU * ripple_fy * x as f32 / wf + ripple_ph).cos();
-                        let shade = 1.0
-                            - curl_shade
-                                * 0.4
-                                * (std::f32::consts::TAU * ripple_fx * y as f32 / hf + ripple_ph)
-                                    .sin()
-                                    .abs();
-                        (x as f32 + ox, y as f32 + oy, shade)
+                        let p1 = std::f32::consts::TAU * ripple_fx * y as f32 / hf + ripple_ph;
+                        let p2 = std::f32::consts::TAU * ripple_fy * x as f32 / wf + ripple_ph;
+                        let ox = curl_px * 0.5 * p1.sin();
+                        let oy = curl_px * 0.3 * p2.cos();
+                        let sh = 1.0 - curl_shade * 0.4 * p1.sin().abs();
+                        let amp = (curl_px / min_d * 12.0).clamp(0.15, 1.1);
+                        (
+                            x as f32 + ox,
+                            y as f32 + oy,
+                            sh,
+                            amp * 0.45 * p2.cos(),
+                            -amp * 0.75 * p1.sin(),
+                            1.0 - curl_shade * 0.25 * p1.sin().abs(),
+                        )
                     } else {
                         let (edge, along_wave) = match curl_side.as_str() {
                             "right" => (x as f32 / wf, wave),
@@ -714,103 +996,204 @@ fn degrade_image_inner(
                             _ => (1.0 - x as f32 / wf, wave),
                         };
                         let shift = curl_px * edge * edge * along_wave;
-                        let (sx, sy) = match curl_side.as_str() {
-                            "right" => (x as f32 - shift, y as f32),
-                            "top" => (x as f32, y as f32 + shift),
-                            "bottom" => (x as f32, y as f32 - shift),
-                            _ => (x as f32 + shift, y as f32),
+                        let s_e =
+                            (curl_px / min_d * 16.0).clamp(0.2, 1.4) * edge * edge * along_wave;
+                        let (sx, sy, dzx, dzy) = match curl_side.as_str() {
+                            "right" => (x as f32 - shift, y as f32, s_e, 0.0),
+                            "top" => (x as f32, y as f32 + shift, 0.0, -s_e),
+                            "bottom" => (x as f32, y as f32 - shift, 0.0, s_e),
+                            _ => (x as f32 + shift, y as f32, -s_e, 0.0),
                         };
-                        (sx, sy, 1.0 - curl_shade * edge * edge)
+                        (
+                            sx,
+                            sy,
+                            1.0 - curl_shade * edge * edge,
+                            dzx,
+                            dzy,
+                            1.0 - curl_shade * 0.55 * edge * edge,
+                        )
                     };
+                    if bend_normal_strength > 0.0 {
+                        let inv_len = 1.0 / (dzx * dzx + dzy * dzy + 1.0).sqrt();
+                        let ndotl = ((-dzx * bend_lx - dzy * bend_ly + bend_lz) * inv_len).max(0.0);
+                        let diff_ratio = 0.28 + 0.72 * (ndotl / bend_lz.max(0.25));
+                        let lit = 1.0 + bend_normal_strength * (diff_ratio - 1.0);
+                        shade = (ao * lit).clamp(0.35, 1.18);
+                    }
                     let p = sample_bilinear(&src, w, h, sx, sy);
                     let i = ((y * w + x) * 3) as usize;
-                    let (q0, q1, q2) = (p[0] * shade, p[1] * shade, p[2] * shade);
+                    let q0 = (p[0] * shade).clamp(0.0, 255.0);
+                    let q1 = (p[1] * shade).clamp(0.0, 255.0);
+                    let q2 = (p[2] * shade).clamp(0.0, 255.0);
                     buf[i] = q0;
                     buf[i + 1] = q1;
                     buf[i + 2] = q2;
                     warp_acc.fold(q0 + q1 + q2, x, y, warp_thresh3);
                 }
             }
-            clamp_buf(&mut buf);
         }
     }
 
     tick!("bend");
 
-    // --- 3. perspective warp (homography from jittered corners) ---
+    // --- 3. perspective warp (+ independent per-corner detachment when enabled) ---
     let perspective_max_frac = s * 0.07;
     let wf = w as f32;
     let hf = h as f32;
     let corners = [(0.0, 0.0), (wf, 0.0), (wf, hf), (0.0, hf)];
+    let mut persp_raw = [[0.0f64; 2]; 4];
+    for slot in &mut persp_raw {
+        slot[0] = rng.gen_range(-1.0..1.0) * perspective_max_frac as f64 * wf as f64;
+        slot[1] = rng.gen_range(-1.0..1.0) * perspective_max_frac as f64 * hf as f64;
+    }
+
+    let frame_min_dim = w.min(h) as f32;
+    let frame_safe_px = ((0.002 * frame_min_dim).round() as u32).max(3);
     let mut dst = [(0.0f64, 0.0f64); 4];
     let mut corner_offsets = [[0.0f32; 2]; 4];
-    for (i, &(cx, cy)) in corners.iter().enumerate() {
-        let dx = rng.gen_range(-1.0..1.0) * perspective_max_frac as f64 * wf as f64;
-        let dy = rng.gen_range(-1.0..1.0) * perspective_max_frac as f64 * hf as f64;
-        dst[i] = (cx as f64 + dx, cy as f64 + dy);
-        corner_offsets[i] = [dx as f32, dy as f32];
-    }
-    // Shrink-to-fit per corner: inward motion kept whole; outward motion
-    // trimmed to a 0.4% quiet-margin sliver so content never leaves the frame.
-    let bleed = 0.004 * (wf as f64).min(hf as f64);
+    let mut corner_detach_px = [[0.0f32; 2]; 4];
+    let mut corner_detach_modes = [String::new(), String::new(), String::new(), String::new()];
     let mut warp_fit_scale = 1.0f32;
     let mut warp_out_px = 0.0f32;
-    for i in 0..4 {
-        let (cx, cy) = corners[i];
-        let (mut dx, mut dy) = (dst[i].0 - cx as f64, dst[i].1 - cy as f64);
-        for (c, dim, d) in [
-            (cx as f64, wf as f64, &mut dx),
-            (cy as f64, hf as f64, &mut dy),
-        ] {
-            let lo = -(c + bleed);
-            let hi = dim - c + bleed;
-            let clamped = (*d).clamp(lo, hi);
-            if d.abs() > 1e-9 {
-                warp_fit_scale = warp_fit_scale.min((clamped / *d) as f32);
+    let mut detached_bent_bbox: Option<[u32; 4]> = None;
+
+    if use_detached {
+        // Project pre_bend_bbox through Stage 2 bend so we have exact bent-space
+        // content bounds before GPU chain1 runs (zero extra GPU round-trips).
+        let bent_bbox = pre_bend_bbox.map(|[x0, y0, x1, y1]| {
+            if !bend_active {
+                return [x0, y0, x1, y1];
             }
-            *d = clamped;
-        }
-        dst[i] = (cx as f64 + dx, cy as f64 + dy);
-        corner_offsets[i] = [dx as f32, dy as f32];
-        warp_out_px = warp_out_px.max(
-            (-dst[i].0)
-                .max(dst[i].0 - wf as f64)
-                .max(-dst[i].1)
-                .max(dst[i].1 - hf as f64)
-                .max(0.0) as f32,
+            let mut min_x = f64::INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut visit = |sx: f64, sy: f64| {
+                let (bx, by) = reproject::bend_forward_exact_raw(
+                    sx,
+                    sy,
+                    w,
+                    h,
+                    &curl_side,
+                    curl_px,
+                    bend_spine_cx,
+                    bend_spine_w,
+                    bend_ripple_fx,
+                    bend_ripple_fy,
+                    bend_ripple_ph,
+                );
+                min_x = min_x.min(bx);
+                min_y = min_y.min(by);
+                max_x = max_x.max(bx);
+                max_y = max_y.max(by);
+            };
+            for k in 0..=16 {
+                let t = k as f64 / 16.0;
+                let lx = x0 as f64 + (x1 - x0) as f64 * t;
+                let ly = y0 as f64 + (y1 - y0) as f64 * t;
+                visit(lx, y0 as f64);
+                visit(lx, y1 as f64);
+                visit(x0 as f64, ly);
+                visit(x1 as f64, ly);
+            }
+            [
+                (min_x.floor().max(0.0) as u32).min(w.saturating_sub(1)),
+                (min_y.floor().max(0.0) as u32).min(h.saturating_sub(1)),
+                (max_x.ceil().max(0.0) as u32).min(w.saturating_sub(1)),
+                (max_y.ceil().max(0.0) as u32).min(h.saturating_sub(1)),
+            ]
+        });
+        detached_bent_bbox = bent_bbox;
+        let qm = quiet_margins(w, h, bent_bbox);
+        let (d, co, cdp, cdm) = compute_detached_corners(
+            w,
+            h,
+            s,
+            &cfg.corner_detach,
+            persp_raw,
+            bent_bbox,
+            qm,
+            frame_safe_px,
+            &mut rng,
         );
+        dst = d;
+        corner_offsets = co;
+        corner_detach_px = cdp;
+        corner_detach_modes = cdm;
+        for pt in &dst {
+            warp_out_px = warp_out_px.max(
+                (-pt.0)
+                    .max(pt.0 - wf as f64)
+                    .max(-pt.1)
+                    .max(pt.1 - hf as f64)
+                    .max(0.0) as f32,
+            );
+        }
+    } else {
+        // Legacy shrink-to-fit per corner (0.4% bleed sliver).
+        let bleed = 0.004 * (wf as f64).min(hf as f64);
+        for i in 0..4 {
+            let (cx, cy) = corners[i];
+            let (mut dx, mut dy) = (persp_raw[i][0], persp_raw[i][1]);
+            for (c, dim, d) in [
+                (cx as f64, wf as f64, &mut dx),
+                (cy as f64, hf as f64, &mut dy),
+            ] {
+                let lo = -(c + bleed);
+                let hi = dim - c + bleed;
+                let clamped = (*d).clamp(lo, hi);
+                if d.abs() > 1e-9 {
+                    warp_fit_scale = warp_fit_scale.min((clamped / *d) as f32);
+                }
+                *d = clamped;
+            }
+            dst[i] = (cx as f64 + dx, cy as f64 + dy);
+            corner_offsets[i] = [dx as f32, dy as f32];
+            warp_out_px = warp_out_px.max(
+                (-dst[i].0)
+                    .max(dst[i].0 - wf as f64)
+                    .max(-dst[i].1)
+                    .max(dst[i].1 - hf as f64)
+                    .max(0.0) as f32,
+            );
+        }
     }
+    let persp_fill = if use_detached { DESK_BG } else { PAPER_BG };
+    let mut persp_hfwd: Option<[f64; 9]> = None;
     #[cfg(feature = "gpu")]
     let mut persp_hinv: Option<[f64; 9]> = None;
     let mut persp_applied = false;
-    if perspective_max_frac * wf.max(hf) > 0.5 {
+    if use_detached || perspective_max_frac * wf.max(hf) > 0.5 {
         let src_c = corners.map(|(x, y)| (x as f64, y as f64));
-        if let Some(hinv) = solve_homography(src_c, dst).and_then(invert_3x3) {
-            persp_applied = true;
-            #[cfg(feature = "gpu")]
-            {
-                persp_hinv = Some(hinv);
-            }
-            if !use_gpu {
-                warp_acc.reset();
-                let src = buf.clone();
-                for y in 0..h {
-                    for x in 0..w {
-                        let (sx, sy) = apply_h(&hinv, x as f64, y as f64);
-                        let p = sample_bilinear(&src, w, h, sx as f32, sy as f32);
-                        let i = ((y * w + x) * 3) as usize;
-                        buf[i] = p[0];
-                        buf[i + 1] = p[1];
-                        buf[i + 2] = p[2];
-                        warp_acc.fold(p[0] + p[1] + p[2], x, y, warp_thresh3);
+        if let Some(hfwd) = solve_homography(src_c, dst) {
+            if let Some(hinv) = invert_3x3(hfwd) {
+                persp_applied = true;
+                persp_hfwd = Some(hfwd);
+                #[cfg(feature = "gpu")]
+                {
+                    persp_hinv = Some(hinv);
+                }
+                if !use_gpu {
+                    warp_acc.reset();
+                    let src = buf.clone();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let (sx, sy) = apply_h(&hinv, x as f64, y as f64);
+                            let p =
+                                sample_bilinear_fill(&src, w, h, sx as f32, sy as f32, persp_fill);
+                            let i = ((y * w + x) * 3) as usize;
+                            buf[i] = p[0].clamp(0.0, 255.0);
+                            buf[i + 1] = p[1].clamp(0.0, 255.0);
+                            buf[i + 2] = p[2].clamp(0.0, 255.0);
+                        }
                     }
                 }
-                clamp_buf(&mut buf);
             }
         }
     }
     if !persp_applied {
         corner_offsets = [[0.0; 2]; 4];
+        corner_detach_px = [[0.0; 2]; 4];
         warp_fit_scale = 1.0;
         warp_out_px = 0.0;
     }
@@ -832,6 +1215,10 @@ fn degrade_image_inner(
                 rip_fx: bend_ripple_fx,
                 rip_fy: bend_ripple_fy,
                 rip_ph: bend_ripple_ph,
+                light_lx: bend_lx,
+                light_ly: bend_ly,
+                light_lz: bend_lz,
+                normal_strength: bend_normal_strength,
             },
             persp_inv: persp_hinv
                 .map(|hinv| {
@@ -848,6 +1235,7 @@ fn degrade_image_inner(
                     ]
                 })
                 .unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            persp_fill,
             run_bend: bend_active,
             run_persp: persp_hinv.is_some(),
             ..ChainConfig::default()
@@ -863,31 +1251,85 @@ fn degrade_image_inner(
 
     tick!("perspective");
 
-    // --- 3a-frame. photo framing: desk inset or margin-safe tight crop ---
-    let frame_roll: f32 = rng.gen();
-    let frame_mode: &str = if frame_roll < 0.70 { "inset" } else { "tight" };
-    let frame_min_dim = w.min(h) as f32;
-    let frame_safe_px = ((0.002 * frame_min_dim).round() as u32).max(3);
-    let frame_bbox = warp_acc.bbox().or_else(|| {
-        if rescale_k < 1.0 {
-            content_bbox_thresh(&buf, w, h, 200.0)
+    // --- 3a-frame. photo framing: detached per-corner, desk inset, or tight crop ---
+    let pre_frame_w = w;
+    let pre_frame_h = h;
+    let (frame_mode, frame_bbox, frame_quiet_px, frame_pad_px, frame_cut_px) =
+        if use_detached && persp_applied {
+            let qm = quiet_margins(w, h, detached_bent_bbox);
+            ("detached", detached_bent_bbox, qm, [0u32; 4], [0u32; 4])
         } else {
-            content_bbox(&buf, w, h)
-        }
-    });
-    let frame_quiet_px = quiet_margins(w, h, frame_bbox);
-    let (mut frame_pad_px, mut frame_cut_px) = ([0u32; 4], [0u32; 4]);
-    if frame_mode == "inset" {
-        for p in frame_pad_px.iter_mut() {
-            *p = (rng.gen_range(0.008..0.045) * frame_min_dim).round() as u32;
-        }
-    } else {
-        let mut desired = [0u32; 4];
-        for d in desired.iter_mut() {
-            *d = (rng.gen_range(0.004..0.028) * frame_min_dim).round() as u32;
-        }
-        frame_cut_px = margin_safe_crop(desired, frame_quiet_px, frame_safe_px);
-    }
+            let frame_roll: f32 = rng.gen();
+            let fm: &str = if frame_roll < 0.70 { "inset" } else { "tight" };
+            let fb = pre_bend_bbox
+                .map(|[x0, y0, x1, y1]| {
+                    let mut min_x = f64::INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+                    let mut visit = |sx: f64, sy: f64| {
+                        let (bx, by) = if bend_active {
+                            reproject::bend_forward_exact_raw(
+                                sx,
+                                sy,
+                                w,
+                                h,
+                                &curl_side,
+                                curl_px,
+                                bend_spine_cx,
+                                bend_spine_w,
+                                bend_ripple_fx,
+                                bend_ripple_fy,
+                                bend_ripple_ph,
+                            )
+                        } else {
+                            (sx, sy)
+                        };
+                        let (px, py) = if let Some(hfwd) = persp_hfwd {
+                            apply_h(&hfwd, bx, by)
+                        } else {
+                            (bx, by)
+                        };
+                        min_x = min_x.min(px);
+                        min_y = min_y.min(py);
+                        max_x = max_x.max(px);
+                        max_y = max_y.max(py);
+                    };
+                    for k in 0..=16 {
+                        let t = k as f64 / 16.0;
+                        let lx = x0 as f64 + (x1 - x0) as f64 * t;
+                        let ly = y0 as f64 + (y1 - y0) as f64 * t;
+                        visit(lx, y0 as f64);
+                        visit(lx, y1 as f64);
+                        visit(x0 as f64, ly);
+                        visit(x1 as f64, ly);
+                    }
+                    [
+                        (min_x.floor().max(0.0) as u32).min(w.saturating_sub(1)),
+                        (min_y.floor().max(0.0) as u32).min(h.saturating_sub(1)),
+                        (max_x.ceil().max(0.0) as u32).min(w.saturating_sub(1)),
+                        (max_y.ceil().max(0.0) as u32).min(h.saturating_sub(1)),
+                    ]
+                })
+                .or_else(|| {
+                    let _ = &warp_acc;
+                    None
+                });
+            let fq = quiet_margins(w, h, fb);
+            let (mut fp, mut fc) = ([0u32; 4], [0u32; 4]);
+            if fm == "inset" {
+                for p in fp.iter_mut() {
+                    *p = (rng.gen_range(0.008..0.045) * frame_min_dim).round() as u32;
+                }
+            } else {
+                let mut desired = [0u32; 4];
+                for d in desired.iter_mut() {
+                    *d = (rng.gen_range(0.004..0.028) * frame_min_dim).round() as u32;
+                }
+                fc = margin_safe_crop(desired, fq, frame_safe_px);
+            }
+            (fm, fb, fq, fp, fc)
+        };
 
     tick!("framing");
 
@@ -979,6 +1421,11 @@ fn degrade_image_inner(
                 }
             } else {
                 let (cl, ct) = (frame_cut_px[0] as i64, frame_cut_px[1] as i64);
+                let oob_rim = if frame_mode == "detached" {
+                    DESK
+                } else {
+                    PAPER_BG
+                };
                 for y in 0..h2 {
                     for x in 0..w2 {
                         let dx = x as f32 - cx1;
@@ -1004,7 +1451,7 @@ fn degrade_image_inner(
                                     let jx = ix + cl;
                                     let jy = iy + ct;
                                     if jx < 0 || jy < 0 || jx >= w as i64 || jy >= h as i64 {
-                                        PAPER_BG
+                                        oob_rim
                                     } else {
                                         let j = ((jy as u32 * w + jx as u32) * 3) as usize;
                                         [src[j], src[j + 1], src[j + 2]]
@@ -1040,10 +1487,64 @@ fn degrade_image_inner(
 
     tick!("rotation");
 
-    // --- 3a2. coupled 3D paper crumpling normal shading (photometric only;
-    // runs after framing so content_bbox / quiet_margins are unaffected) ---
-    let crumple_strength =
-        realism::apply_crumple_shading(&mut buf, w, h, &mut rng, s, cfg.realism.enable_crumple);
+    // --- 3a2. fused 6-octave phasor 3D micro-relief (crumple + cockle + tooth + plate + gutter) ---
+    let relief_out = {
+        let (fw_u, fh_u) = framed_dims(
+            pre_frame_w,
+            pre_frame_h,
+            frame_mode,
+            frame_pad_px,
+            frame_cut_px,
+        );
+        let w0f = (pre_frame_w as f32).max(1.0);
+        let h0f = (pre_frame_h as f32).max(1.0);
+        let (ox, oy) = if frame_mode == "inset" {
+            (frame_pad_px[0] as f32, frame_pad_px[1] as f32)
+        } else {
+            (-(frame_cut_px[0] as f32), -(frame_cut_px[1] as f32))
+        };
+        let (u0, du_dx, du_dy, v0, dv_dx, dv_dy) = if rot_active && !use_gpu {
+            let th = rotation_deg.to_radians();
+            let (snt, cst) = (th.sin(), th.cos());
+            let (cx0, cy0) = (fw_u as f32 * 0.5, fh_u as f32 * 0.5);
+            let (cx1, cy1) = (wf * 0.5, hf * 0.5);
+            let fx0 = cx0 - cx1 * cst - cy1 * snt - ox;
+            let fy0 = cy0 + cx1 * snt - cy1 * cst - oy;
+            (
+                fx0 / w0f,
+                cst / w0f,
+                snt / w0f,
+                fy0 / h0f,
+                -snt / h0f,
+                cst / h0f,
+            )
+        } else {
+            (-ox / w0f, 1.0 / w0f, 0.0, -oy / h0f, 0.0, 1.0 / h0f)
+        };
+        let rctx = realism::MicroReliefContext {
+            file_seed,
+            strength: s,
+            rescale_k,
+            u0,
+            du_dx,
+            du_dy,
+            v0,
+            dv_dx,
+            dv_dy,
+            water_present: paper_p.water_present,
+            water_u: paper_p.water_x,
+            water_v: paper_p.water_y,
+            water_r: paper_p.water_radius,
+            water_amount: paper_p.water_amount,
+            paper_cockle: paper_p.cockle,
+            paper_edge: paper_p.edge,
+            spine_active: bend_active && bend_mode == "spine",
+            spine_u: bend_spine_cx / w0f,
+            spine_w: bend_spine_w / w0f,
+        };
+        realism::apply_micro_relief_shading(&mut buf, w, h, &mut rng, &cfg.realism, &rctx)
+    };
+    let crumple_strength = relief_out.crumple_strength;
 
     tick!("crumple");
 
@@ -1118,7 +1619,8 @@ fn degrade_image_inner(
         }
     }
 
-    // Coffee ring + satellite splats, parked on quiet paper.
+    // Coffee ring + satellite splats, parked on quiet paper (capillary rim + ink bleed).
+    let mut stain_ink_bleed = 0.0f32;
     if rng.gen::<f32>() < s * 0.45 {
         if let Some((gx, gy)) = pick_quiet_cell(&mut rng, &ink, igw, igh, 0.06) {
             let jit = 20.0 * rescale_k;
@@ -1126,13 +1628,32 @@ fn degrade_image_inner(
             let cy = (gy * ink_cell + ink_cell / 2) as f32 + rng.gen_range(-jit..jit);
             let r = w.min(h) as f32 * rng.gen_range(0.02..0.06);
             const COFFEE: [f32; 3] = [122.0, 82.0, 42.0];
-            let stamp = banks::precompute_coffee(r);
-            banks::stamp_coffee(&mut buf, w, h, cx, cy, &stamp);
-            if let Some(ref mut am) = art_mask {
-                for &(dx, dy, _) in &stamp.cells {
-                    let (px, py) = (cx as i64 + dx as i64, cy as i64 + dy as i64);
-                    if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                        am[(py as u32 * w + px as u32) as usize] |= artifact_bits::STAIN;
+            if cfg.realism.enable_capillary_stains {
+                stain_ink_bleed = if cfg.realism.xerox_heavy {
+                    0.0
+                } else {
+                    s * rng.gen_range(0.14..0.32)
+                };
+                let st = banks::precompute_capillary_stain(r, &mut rng, stain_ink_bleed);
+                banks::stamp_capillary_stain(
+                    &mut buf,
+                    w,
+                    h,
+                    cx,
+                    cy,
+                    &st,
+                    art_mask.as_deref_mut(),
+                    artifact_bits::STAIN,
+                );
+            } else {
+                let stamp = banks::precompute_coffee(r);
+                banks::stamp_coffee(&mut buf, w, h, cx, cy, &stamp);
+                if let Some(ref mut am) = art_mask {
+                    for &(dx, dy, _) in &stamp.cells {
+                        let (px, py) = (cx as i64 + dx as i64, cy as i64 + dy as i64);
+                        if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                            am[(py as u32 * w + px as u32) as usize] |= artifact_bits::STAIN;
+                        }
                     }
                 }
             }
@@ -1290,24 +1811,32 @@ fn degrade_image_inner(
         highlight = cname.to_string();
     }
 
-    // Paper-fold creases: full-span valley + ridge highlight + soft one-sided shade.
+    // Paper-fold creases: dihedral bevel + organic wobble + ink-flake cracking.
     let mut fold_creases: Vec<[f32; 3]> = Vec::new();
     let n_crease = if rng.gen::<f32>() < s * 0.5 {
         rng.gen_range(1..=2)
     } else {
         0
     };
-    for _ in 0..n_crease {
+    let crease_crack_strength = if n_crease > 0 && cfg.realism.enable_dihedral_creases {
+        s * rng.gen_range(0.35..0.75)
+    } else {
+        0.0
+    };
+    for crease_idx in 0..n_crease {
         let ang = rng.gen_range(0.0..180.0f32).to_radians();
         let pos = rng.gen_range(0.15..0.85);
         let cstr = rng.gen_range(0.5..1.0) * s;
+        let crease_ph = rng.gen_range(0.0..std::f32::consts::TAU);
         let (nx, ny) = (ang.cos(), ang.sin());
-        let valley = (w.min(h) as f32 * 0.0016).clamp(1.0, 4.0);
+        let w_v = (w.min(h) as f32 * 0.0014).clamp(1.0, 3.5);
+        let w_r = (w_v * 0.90).clamp(1.0, 3.0);
         let shade_w = w.min(h) as f32 * rng.gen_range(0.015..0.035);
-        let lim = (valley + 1.5).max(shade_w);
+        let lim = (w_v * 2.5 + 2.0).max(shade_w) + 2.0 * rescale_k;
         let off = (pos - 0.5) * w.min(h) as f32;
         let hw = w as f32 / 2.0;
         let hh = h as f32 / 2.0;
+        let crack_seed = (file_seed as u32) ^ (crease_idx as u32).wrapping_mul(0x9E37_79B9);
         for y in 0..h {
             let c = ny * (y as f32 - hh) - nx * hw - off;
             let (mut xa, mut xb) = if nx.abs() < 1e-9 {
@@ -1326,40 +1855,79 @@ fn degrade_image_inner(
             xa = xa.max(0);
             xb = xb.min(w as i64 - 1);
             for x in xa..=xb {
-                let d = (x as f32 - hw) * nx + (y as f32 - hh) * ny - off;
+                let dx0 = x as f32 - hw;
+                let dy0 = y as f32 - hh;
+                let along = -dx0 * ny + dy0 * nx;
+                let wobble = if cfg.realism.enable_dihedral_creases {
+                    (0.65 * (along * 0.025 + crease_ph).sin()
+                        + 0.35 * (along * 0.083 + crease_ph * 1.7).sin())
+                        * 1.1
+                        * rescale_k
+                } else {
+                    0.0
+                };
+                let d = dx0 * nx + dy0 * ny - off + wobble;
+                let av = d.abs();
+                if av > lim {
+                    continue;
+                }
                 let pix = (y * w + x as u32) as usize;
                 let i = pix * 3;
-                let av = d.abs();
-                if av < valley {
-                    for c in 0..3 {
-                        buf[i + c] *= 1.0 - 0.22 * cstr;
+                let facet = if d < 0.0 && av < shade_w {
+                    let t = 1.0 - av / shade_w;
+                    1.0 - 0.11 * cstr * t * t
+                } else if d > 0.0 && av < shade_w * 0.6 {
+                    let t = 1.0 - av / (shade_w * 0.6);
+                    1.0 + 0.03 * cstr * t * t
+                } else {
+                    1.0
+                };
+                let valley = (-((d + 0.35 * w_v) / w_v).powi(2)).exp();
+                let ridge = (-((d - 0.85 * w_v) / w_r).powi(2)).exp();
+                let mult = facet * (1.0 - 0.34 * cstr * valley);
+                let spec = 38.0 * cstr * ridge;
+                for c in 0..3 {
+                    let v = buf[i + c] * mult;
+                    let headroom = ((255.0 - v) / 255.0).clamp(0.15, 1.0);
+                    buf[i + c] = (v + spec * headroom).clamp(0.0, 255.0);
+                }
+                if crease_crack_strength > 0.0 && av < w_v * 1.15 {
+                    let luma = 0.299 * buf[i] + 0.587 * buf[i + 1] + 0.114 * buf[i + 2];
+                    if luma < 165.0 {
+                        let core_w = (-(d / (w_v * 0.65)).powi(2)).exp();
+                        let q_along = (along * 0.65).floor() as i32;
+                        let q_perp = (d * 1.2).floor() as i32;
+                        let hh_u = realism::hash2_u32(q_along, q_perp, crack_seed);
+                        let thresh = 1.0 - (0.55 * crease_crack_strength * core_w).clamp(0.0, 0.72);
+                        if hh_u > thresh {
+                            let flake = ((hh_u - thresh) / (1.0 - thresh).max(1e-4)).sqrt()
+                                * (0.55 + 0.33 * crease_crack_strength);
+                            const FIBER: [f32; 3] = [238.0, 234.0, 224.0];
+                            for c in 0..3 {
+                                buf[i + c] = buf[i + c] * (1.0 - flake) + FIBER[c] * flake;
+                            }
+                        }
                     }
+                }
+                if valley > 0.25 || ridge > 0.25 {
                     if let Some(ref mut am) = art_mask {
                         am[pix] |= artifact_bits::FOLD_CREASE;
-                    }
-                } else if (d - valley) > 0.0 && (d - valley) < 1.5 {
-                    for c in 0..3 {
-                        buf[i + c] = (buf[i + c] + 24.0 * cstr).clamp(0.0, 255.0);
-                    }
-                    if let Some(ref mut am) = art_mask {
-                        am[pix] |= artifact_bits::FOLD_CREASE;
-                    }
-                } else if d < 0.0 && av < shade_w {
-                    let f = 1.0 - 0.07 * cstr * (1.0 - av / shade_w);
-                    for c in 0..3 {
-                        buf[i + c] *= f;
                     }
                 }
             }
         }
         fold_creases.push([ang.to_degrees(), pos, cstr]);
     }
-    clamp_buf(&mut buf);
 
     tick!("artifacts");
 
-    // --- 3b2. heavy wear: ink loss, printer artifacts, eraser, stains ---
+    // --- 3b2. heavy wear: ink loss, printer artifacts, eraser, stains + Xerox drum ghost ---
     let wear_p = wear::apply(&mut buf, w, h, &mut rng, s, rescale_k);
+    let (drum_ghost_period_px, drum_ghost_alpha) = if cfg.realism.enable_drum_ghost {
+        wear::apply_drum_ghost_pass(&mut buf, w, h, &mut rng, s, rescale_k)
+    } else {
+        (0, 0.0)
+    };
 
     tick!("wear");
 
@@ -1393,7 +1961,7 @@ fn degrade_image_inner(
 
     tick!("lens");
 
-    // --- 4. focus: uniform defocus or tilt-shift band ---
+    // --- 4. focus: uniform defocus or tilt-shift band + Petzval field curvature ---
     let focus_mode: &str = if rng.gen::<f32>() < 0.5 {
         "uniform"
     } else {
@@ -1403,40 +1971,71 @@ fn degrade_image_inner(
     let focus_h = rng.gen_range(0.10..0.35);
     let tilt_sigma = s * rng.gen_range(1.0..3.0) * rescale_k;
     let blur_sigma = s * rng.gen_range(0.5..2.4) * rescale_k;
+    let (ca_optical_center, ca_cubic_weight, field_curvature) =
+        if cfg.realism.enable_radial_optics && s > 0.05 {
+            (
+                [rng.gen_range(0.44..0.56f32), rng.gen_range(0.44..0.56f32)],
+                0.75f32,
+                s * rng.gen_range(0.25..0.60),
+            )
+        } else {
+            ([0.5, 0.5], 0.0, 0.0)
+        };
     if !use_gpu {
-        if focus_mode == "tilt" && tilt_sigma > 0.05 {
-            let bb: Vec<f32> = {
-                let tmp = vec_to_image(&buf, w, h);
-                let blurred = image::imageops::blur(&tmp, tilt_sigma);
-                blurred
+        let tilt_branch = focus_mode == "tilt" && tilt_sigma > 0.05;
+        let eff_sigma = if tilt_branch { tilt_sigma } else { blur_sigma };
+        if eff_sigma > 0.05 {
+            let tmp = vec_to_image(&buf, w, h);
+            let blurred = image::imageops::blur(&tmp, eff_sigma);
+            if tilt_branch || field_curvature > 0.0 {
+                let bb: Vec<f32> = blurred
                     .pixels()
                     .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-                    .collect()
-            };
-            for y in 0..h {
-                let d = ((y as f32 / h.max(1) as f32) - focus_y).abs();
-                let m = ((d - focus_h) / 0.08).clamp(0.0, 1.0);
-                let m = m * m * (3.0 - 2.0 * m);
-                for x in 0..w {
-                    let i = ((y * w + x) * 3) as usize;
-                    for c in 0..3 {
-                        buf[i + c] = buf[i + c] * (1.0 - m) + bb[i + c] * m;
+                    .collect();
+                let max_r = (0.5 * wf.hypot(hf)).max(1.0);
+                let ocx = wf * ca_optical_center[0];
+                let ocy = hf * ca_optical_center[1];
+                for y in 0..h {
+                    let mut m_row = if tilt_branch {
+                        let d = ((y as f32 / h.max(1) as f32) - focus_y).abs();
+                        let mt = ((d - focus_h) / 0.08).clamp(0.0, 1.0);
+                        mt * mt * (3.0 - 2.0 * mt)
+                    } else {
+                        0.45
+                    };
+                    let rny = (y as f32 - ocy) / max_r;
+                    for x in 0..w {
+                        let m = if field_curvature > 0.0 {
+                            let rnx = (x as f32 - ocx) / max_r;
+                            let t = (((rnx * rnx + rny * rny) - 0.20) / 0.80).clamp(0.0, 1.0);
+                            let m_fc = field_curvature * t * t * (3.0 - 2.0 * t);
+                            if tilt_branch {
+                                m_row.max(m_fc)
+                            } else {
+                                (0.45 + 0.55 * m_fc).clamp(0.0, 1.0)
+                            }
+                        } else {
+                            m_row
+                        };
+                        let i = ((y * w + x) * 3) as usize;
+                        for c in 0..3 {
+                            buf[i + c] = buf[i + c] * (1.0 - m) + bb[i + c] * m;
+                        }
                     }
+                    let _ = &mut m_row;
                 }
+            } else {
+                buf = blurred
+                    .pixels()
+                    .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                    .collect();
             }
-        } else if blur_sigma > 0.05 {
-            let tmp = vec_to_image(&buf, w, h);
-            let blurred = image::imageops::blur(&tmp, blur_sigma);
-            buf = blurred
-                .pixels()
-                .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-                .collect();
         }
     }
 
     tick!("focus");
 
-    // --- 5. lighting: specular glare + directional shadow + vignette ---
+    // --- 5. lighting: glare + shadow + vignette + AWB + phone shadow + specular bloom ---
     let gx = rng.gen_range(0.0..wf);
     let gy = rng.gen_range(0.0..hf);
     let glare_radius = wf.min(hf) * rng.gen_range(0.2..0.6);
@@ -1454,68 +2053,36 @@ fn degrade_image_inner(
         awb_angle_deg.to_radians().cos(),
         awb_angle_deg.to_radians().sin(),
     );
+    let phone_sh = realism::PhoneShadowParams::sample(&mut rng, s, cfg.realism.enable_phone_shadow);
+    let spec_bloom = realism::SpecularBloomParams::sample(
+        &mut rng,
+        s,
+        wf,
+        hf,
+        cfg.realism.enable_specular_bloom,
+    );
+    let use_rolloff = spec_bloom.strength > 0.0;
     let ca_sampled = s * rng.gen_range(0.0..1.5) * rescale_k;
     let ca_px = if toggles.skip_chromatic {
         0.0
     } else {
         ca_sampled
     };
-    if !use_gpu && toggles.fast_banks {
-        let theta = shadow_angle_deg.to_radians();
-        let field = banks::precompute_lighting(
-            w,
-            h,
-            gx,
-            gy,
-            glare_radius,
-            glare_alpha,
-            theta.cos(),
-            theta.sin(),
-            shadow_strength,
-            vignette_strength,
-        );
-        if awb_warm_cool_strength > 0.0 {
-            let diag = (wf * wf + hf * hf).sqrt().max(1.0);
-            let cx = wf / 2.0;
-            let cy = hf / 2.0;
-            for y in 0..h {
-                for x in 0..w {
-                    let pix = (y * w + x) as usize;
-                    let i = pix * 3;
-                    let m = field.mult[pix];
-                    let add = field.add[pix];
-                    let g = realism::awb_channel_gains(
-                        x as f32,
-                        y as f32,
-                        cx,
-                        cy,
-                        diag,
-                        awb_dx,
-                        awb_dy,
-                        awb_warm_cool_strength,
-                    );
-                    buf[i] = buf[i] * m * g[0] + add;
-                    buf[i + 1] = buf[i + 1] * m * g[1] + add;
-                    buf[i + 2] = buf[i + 2] * m * g[2] + add;
-                }
-            }
-        } else {
-            banks::apply_lighting_field(&mut buf, &field);
-        }
-        clamp_buf(&mut buf);
-    }
-    if !use_gpu && !toggles.fast_banks {
+    if !use_gpu {
         let theta = shadow_angle_deg.to_radians();
         let (dx, dy) = (theta.cos(), theta.sin());
         let diag = (wf * wf + hf * hf).sqrt().max(1.0);
         let cx = wf / 2.0;
         let cy = hf / 2.0;
         let max_d = (cx * cx + cy * cy).sqrt().max(1.0);
+        let inv_wf = 1.0 / wf.max(1.0);
+        let inv_hf = 1.0 / hf.max(1.0);
         for y in 0..h {
+            let fy = y as f32;
+            let vn = fy * inv_hf;
             for x in 0..w {
                 let i = ((y * w + x) * 3) as usize;
                 let fx = x as f32;
-                let fy = y as f32;
                 let gd = ((fx - gx).powi(2) + (fy - gy).powi(2)).sqrt();
                 let g = (1.0 - gd / glare_radius).max(0.0);
                 let add = glare_alpha * 255.0 * g * g;
@@ -1534,49 +2101,82 @@ fn degrade_image_inner(
                     awb_dy,
                     awb_warm_cool_strength,
                 );
-                buf[i] = buf[i] * m * ag[0] + add;
-                buf[i + 1] = buf[i + 1] * m * ag[1] + add;
-                buf[i + 2] = buf[i + 2] * m * ag[2] + add;
+                let ps = realism::phone_shadow_gains(&phone_sh, fx * inv_wf, vn);
+                let sp = realism::eval_specular_bloom(&spec_bloom, fx, fy);
+                let r = buf[i] * m * ag[0] * ps[0] + add + sp;
+                let gg = buf[i + 1] * m * ag[1] * ps[1] + add + sp * 0.98;
+                let b = buf[i + 2] * m * ag[2] * ps[2] + add + sp * 0.93;
+                if use_rolloff {
+                    buf[i] = realism::soft_highlight_rolloff(r);
+                    buf[i + 1] = realism::soft_highlight_rolloff(gg);
+                    buf[i + 2] = realism::soft_highlight_rolloff(b);
+                } else {
+                    buf[i] = r.clamp(0.0, 255.0);
+                    buf[i + 1] = gg.clamp(0.0, 255.0);
+                    buf[i + 2] = b.clamp(0.0, 255.0);
+                }
             }
         }
-        clamp_buf(&mut buf);
     }
 
     tick!("lighting");
 
-    // --- 5b. chromatic aberration ---
+    // --- 5b. chromatic aberration (legacy linear or off-axis cubic radial) ---
     if ca_px > 0.05 && !use_gpu {
         let src = buf.clone();
-        for y in 0..h {
-            for x in 0..w {
-                let dx = (x as f32 - wf / 2.0) / wf.max(1.0);
-                let dy = (y as f32 - hf / 2.0) / hf.max(1.0);
-                let r = sample_bilinear(&src, w, h, x as f32 - dx * ca_px, y as f32 - dy * ca_px);
-                let b = sample_bilinear(&src, w, h, x as f32 + dx * ca_px, y as f32 + dy * ca_px);
-                let i = ((y * w + x) * 3) as usize;
-                buf[i] = r[0];
-                buf[i + 2] = b[2];
+        if ca_cubic_weight > 0.0 {
+            let ocx = wf * ca_optical_center[0];
+            let ocy = hf * ca_optical_center[1];
+            let max_r = (0.5 * wf.hypot(hf)).max(1.0);
+            for y in 0..h {
+                let ny = (y as f32 - ocy) / max_r;
+                for x in 0..w {
+                    let nx = (x as f32 - ocx) / max_r;
+                    let r2 = (nx * nx + ny * ny).min(1.5);
+                    let gain = ((1.0 - ca_cubic_weight) + ca_cubic_weight * r2) * ca_px;
+                    let sx = nx * gain;
+                    let sy = ny * gain;
+                    let r = sample_bilinear(&src, w, h, x as f32 - 0.90 * sx, y as f32 - 0.90 * sy);
+                    let b = sample_bilinear(&src, w, h, x as f32 + 1.15 * sx, y as f32 + 1.15 * sy);
+                    let i = ((y * w + x) * 3) as usize;
+                    buf[i] = r[0].clamp(0.0, 255.0);
+                    buf[i + 2] = b[2].clamp(0.0, 255.0);
+                }
+            }
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = (x as f32 - wf / 2.0) / wf.max(1.0);
+                    let dy = (y as f32 - hf / 2.0) / hf.max(1.0);
+                    let r =
+                        sample_bilinear(&src, w, h, x as f32 - dx * ca_px, y as f32 - dy * ca_px);
+                    let b =
+                        sample_bilinear(&src, w, h, x as f32 + dx * ca_px, y as f32 + dy * ca_px);
+                    let i = ((y * w + x) * 3) as usize;
+                    buf[i] = r[0].clamp(0.0, 255.0);
+                    buf[i + 2] = b[2].clamp(0.0, 255.0);
+                }
             }
         }
-        clamp_buf(&mut buf);
     }
 
     tick!("chromatic");
 
     // --- 5c. capture optics & handling ---
-    let capture_p = capture::apply(&mut buf, w, h, &mut rng, s, rescale_k);
+    let mut capture_p = capture::apply(&mut buf, w, h, &mut rng, s, rescale_k);
     if let Some(ref mut am) = art_mask {
         masks::stamp_capture_artifacts(am, art_w, art_h, &capture_p);
     }
 
     tick!("capture");
 
-    // --- 5d. smartphone ISP unsharp-mask (USM) micro-contrast haloing ---
-    let usm_strength = realism::apply_usm(&mut buf, w, h, &mut rng, s, cfg.realism.enable_usm);
+    // --- 5d. smartphone ISP edge-aware HDR unsharp-mask (USM) ---
+    let (usm_strength, hdr_shadow_boost) =
+        realism::apply_usm_hdr(&mut buf, w, h, &mut rng, s, cfg.realism.enable_usm);
 
     tick!("usm");
 
-    // --- 6. sensor noise (Poisson-Gaussian) + 6b. capture downscale (fused on GPU) ---
+    // --- 6. sensor noise (Poisson-Gaussian + 1/4-res chroma blotch) + 6b. capture downscale ---
     let noise_sampled = s * rng.gen_range(3.0..14.0) * rescale_k;
     let noise_sigma = if toggles.skip_noise {
         0.0
@@ -1588,6 +2188,12 @@ fn degrade_image_inner(
             (noise_sigma * 0.65, noise_sigma * 0.75)
         } else {
             (noise_sigma, 0.0)
+        };
+    let chroma_noise_sigma =
+        if !toggles.skip_noise && cfg.realism.enable_chroma_noise && noise_sigma > 0.05 {
+            (noise_sigma * 0.85).clamp(0.0, 12.0)
+        } else {
+            0.0
         };
 
     let (scale_x, scale_y) = {
@@ -1613,6 +2219,7 @@ fn degrade_image_inner(
             let tilt_branch = focus_mode == "tilt" && tilt_sigma > 0.05;
             let post_cfg = ChainConfig {
                 blur_sigma: if tilt_branch { tilt_sigma } else { blur_sigma },
+                field_curvature,
                 light: LightingKnobs {
                     gx,
                     gy,
@@ -1625,15 +2232,34 @@ fn degrade_image_inner(
                     awb_dx,
                     awb_dy,
                     awb_strength: awb_warm_cool_strength,
+                    phone_cx: phone_sh.cx,
+                    phone_cy: phone_sh.cy,
+                    phone_hw: phone_sh.hw,
+                    phone_hh: phone_sh.hh,
+                    phone_cos_a: phone_sh.cos_a,
+                    phone_sin_a: phone_sh.sin_a,
+                    phone_penumbra: phone_sh.penumbra,
+                    phone_strength_signed: phone_sh.strength * phone_sh.hand_side,
+                    spec_sx: spec_bloom.sx,
+                    spec_sy: spec_bloom.sy,
+                    spec_inv_radius: spec_bloom.inv_radius,
+                    spec_strength: spec_bloom.strength,
+                    spec_cos_a: spec_bloom.cos_a,
+                    spec_sin_a: spec_bloom.sin_a,
+                    spec_aspect: spec_bloom.aspect,
+                    spec_rolloff: if use_rolloff { 1.0 } else { 0.0 },
                 },
                 ca_px,
+                ca_optical_center,
+                ca_cubic_weight,
                 noise_sigma: noise_read_sigma,
                 noise_shot_sigma,
+                chroma_noise_sigma,
                 noise_seed: gpu_backend::noise_seed32(file_seed),
                 run_blur: tilt_branch || blur_sigma > 0.05,
                 run_light: true,
                 run_ca: ca_px > 0.05,
-                run_noise: noise_sigma > 0.05,
+                run_noise: noise_sigma > 0.05 || chroma_noise_sigma > 0.05,
                 tilt_active: tilt_branch,
                 focus_y,
                 focus_h,
@@ -1654,6 +2280,9 @@ fn degrade_image_inner(
             clamp_buf(&mut buf);
             (sx, sy)
         } else {
+            if chroma_noise_sigma > 0.05 {
+                realism::apply_chroma_noise_cpu(&mut buf, w, h, file_seed, chroma_noise_sigma);
+            }
             run_cpu_noise_and_downscale(
                 &mut buf,
                 &mut w,
@@ -1668,6 +2297,9 @@ fn degrade_image_inner(
         }
         #[cfg(not(feature = "gpu"))]
         {
+            if chroma_noise_sigma > 0.05 {
+                realism::apply_chroma_noise_cpu(&mut buf, w, h, file_seed, chroma_noise_sigma);
+            }
             run_cpu_noise_and_downscale(
                 &mut buf,
                 &mut w,
@@ -1684,21 +2316,57 @@ fn degrade_image_inner(
 
     tick!("noise+downscale");
 
-    // --- 6c. procedural desk surface + contact shadow + sheet-protector sheen ---
+    // --- 6c. procedural desk surface + contact shadow + holes + ledge + occluder + sheen ---
     let desk_surface: String = if cfg.realism.enable_desk_surface && s > 0.05 {
-        ["walnut", "slate", "cloth"][rng.gen_range(0..3)].to_string()
+        ["walnut", "oak", "granite_laminate", "slate", "cloth"][rng.gen_range(0..5)].to_string()
     } else {
         "none".to_string()
     };
-    let sheen = realism::SheenParams::sample(&mut rng, s, cfg.realism.enable_sheen);
+    if desk_surface != "none" && capture_p.enabled && capture_p.hole_radius > 0 {
+        capture_p.hole_desk_through = true;
+    }
+    let tape_style = if !capture_p.enabled {
+        "none".to_string()
+    } else if (capture_p.tape_edge + capture_p.sticky_tone).is_multiple_of(3) {
+        "clear_frosted".to_string()
+    } else {
+        "aged_beige".to_string()
+    };
+    let sheen = realism::SheenParams::sample(
+        &mut rng,
+        s,
+        cfg.realism.enable_sheen,
+        cfg.realism.enable_thermal_physics,
+    );
+    let stand_ledge_px: u32 =
+        if cfg.realism.enable_stand_ledge && s > 0.2 && rng.gen::<f32>() < 0.35 {
+            let avail_b = frame_quiet_px[3]
+                .saturating_sub(frame_cut_px[3])
+                .saturating_sub(frame_safe_px);
+            let scaled_avail = ((avail_b as f32) * scale_y).floor() as u32;
+            let want = (h as f32 * rng.gen_range(0.014..0.032)).round() as u32;
+            want.min(scaled_avail)
+        } else {
+            0
+        };
+    let tone_curve = realism::ToneCurveParams::sample(&mut rng, s, cfg.realism.enable_tone_curve);
 
-    // --- 7. JPEG compression round-trip ---
+    // --- 7. JPEG compression round-trip (+ optional shifted double-JPEG) ---
     let jpeg_quality: u8 = match cfg.jpeg_quality {
         Some(q) => q,
         None => ((80.0 - s * 30.0 + rng.gen_range(-8.0..8.0)).clamp(30.0, 95.0)) as u8,
     };
+    let (double_jpeg_q1, double_jpeg_dx, double_jpeg_dy) =
+        if cfg.realism.enable_double_jpeg && jpeg_quality < 95 && rng.gen::<f32>() < 0.28 * s {
+            let q1 = rng
+                .gen_range(78..=88u8)
+                .max(jpeg_quality.saturating_add(6).min(95));
+            (q1, rng.gen_range(2..=6u32), rng.gen_range(2..=6u32))
+        } else {
+            (0u8, 0u32, 0u32)
+        };
 
-    let params = DegradeParams {
+    let mut params = DegradeParams {
         input: String::new(),
         output: String::new(),
         file_seed,
@@ -1771,12 +2439,123 @@ fn degrade_image_inner(
         desk_surface: desk_surface.clone(),
         crumple_strength,
         sheen_strength: sheen.strength,
+        corner_detach_px,
+        corner_detach_modes,
+        paper_weave_stock: weave_s.stock.as_str().to_string(),
+        paper_weave_strength: weave_s.strength,
+        paper_laid_wire_px: weave_s.laid_wire_px,
+        paper_laid_chain_px: weave_s.laid_chain_px,
+        paper_wove_anisotropy: weave_s.wove_anisotropy,
+        paper_tooth_light_deg: weave_s.tooth_light_deg,
+        cellulose_fiber_count: pulp_out.cellulose_fiber_count,
+        cellulose_fiber_opacity: pulp_out.cellulose_fiber_opacity,
+        rag_thread_count: pulp_out.rag_thread_count,
+        pulp_fleck_count: pulp_out.pulp_fleck_count,
+        surface_lint_count: pulp_out.surface_lint_count,
+        dust_mote_count: pulp_out.dust_mote_count,
+        edge_oxidation_strength: archival_p.edge_oxidation_strength,
+        edge_oxidation_depths: archival_p.edge_oxidation_depths,
+        foxing_cluster_count: archival_p.foxing_cluster_count,
+        foxing_halo_strength: archival_p.foxing_halo_strength,
+        grease_patch_count: archival_p.grease_patch_count,
+        grease_patch_strength: archival_p.grease_patch_strength,
+        watermark_style: archival_p.watermark_style,
+        watermark_strength: archival_p.watermark_strength,
+        paper_stock: brdf_p.stock.as_str().to_string(),
+        brdf_albedo_ceil: brdf_p.albedo_ceil,
+        brdf_black_floor: brdf_p.black_floor,
+        brdf_oba_strength: brdf_p.oba_strength,
+        brdf_spec_gain: brdf_p.spec_gain,
+        brdf_ink_spread: brdf_p.ink_spread,
+        cockle_relief_strength: relief_out.cockle_relief_strength,
+        tooth_bump_strength: relief_out.tooth_bump_strength,
+        raking_light_angle_deg: relief_out.raking_light_angle_deg,
+        raking_elevation_deg: relief_out.raking_elevation_deg,
+        plate_mark_strength: relief_out.plate_mark_strength,
+        plate_mark_inset: relief_out.plate_mark_inset,
+        gutter_emboss_strength: relief_out.gutter_emboss_strength,
+        phone_shadow_strength: phone_sh.strength,
+        phone_shadow_center: [phone_sh.cx, phone_sh.cy],
+        phone_shadow_angle_deg: phone_sh.angle_deg,
+        phone_shadow_penumbra: phone_sh.penumbra,
+        bend_normal_strength,
+        bend_light_vec: [bend_lx, bend_ly, bend_lz],
+        ca_optical_center,
+        ca_cubic_weight,
+        field_curvature,
+        specular_bloom_strength: spec_bloom.strength,
+        specular_bloom_center: [spec_bloom.sx, spec_bloom.sy],
+        specular_bloom_radius: spec_bloom.radius,
+        specular_bloom_aspect: spec_bloom.aspect,
+        specular_bloom_angle_deg: spec_bloom.angle_deg,
+        tone_black_lift: tone_curve.black_lift,
+        tone_white_ceil: tone_curve.white_ceil,
+        tone_contrast: tone_curve.contrast,
+        chroma_noise_sigma,
+        hdr_shadow_boost,
+        double_jpeg_q1,
+        stain_ink_bleed,
+        crease_crack_strength,
+        drum_ghost_period_px,
+        drum_ghost_alpha,
+        thermal_fade,
+        thermal_tone,
+        thermal_scratches,
+        scanner_edge_mask: 0,
+        scanner_edge_width_px: 0,
+        ccd_dust_lines: 0,
+        ink_micro_grain_sigma,
+        ink_edge_feather_amp,
+        ink_halftone_amp,
+        stand_ledge_px,
+        edge_occluder_kind: "none".to_string(),
+        edge_occluder_edge: 0,
+        edge_occluder_pen_px: 0.0,
+        tape_style,
     };
 
-    realism::apply_desk_and_sheen(&mut buf, &params, &desk_surface, &sheen, file_seed);
+    let occluder =
+        realism::EdgeOccluder::sample(&mut rng, &params, cfg.realism.enable_edge_occluder);
+    params.edge_occluder_kind = occluder.kind.to_string();
+    params.edge_occluder_edge = occluder.edge;
+    params.edge_occluder_pen_px = occluder.pen_px;
+
+    realism::apply_desk_and_sheen(
+        &mut buf,
+        &params,
+        &desk_surface,
+        &sheen,
+        stand_ledge_px,
+        &occluder,
+        file_seed,
+    );
+    let scan_art = realism::apply_scanner_artifacts(
+        &mut buf,
+        w,
+        h,
+        &mut rng,
+        s,
+        cfg.realism.enable_scanner_bar,
+        cfg.realism.xerox_heavy,
+    );
+    params.scanner_edge_mask = scan_art.edge_mask;
+    params.scanner_edge_width_px = scan_art.edge_width_px;
+    params.ccd_dust_lines = scan_art.ccd_lines;
     tick!("desk+sheen");
 
-    let mut out_img = vec_to_image(&buf, w, h);
+    let mut out_img = if tone_curve.enabled {
+        let lut = tone_curve.build_lut();
+        vec_to_image_with_lut(&buf, w, h, &lut)
+    } else {
+        vec_to_image(&buf, w, h)
+    };
+    if double_jpeg_q1 > 0 && jpeg_quality < 100 {
+        if let Some(p1) =
+            jpeg_roundtrip_shifted(&out_img, double_jpeg_q1, double_jpeg_dx, double_jpeg_dy)
+        {
+            out_img = p1;
+        }
+    }
     if jpeg_quality < 100 {
         if let Ok((jpeg_bytes, _)) = encode_jpeg_bytes(out_img.as_raw(), w, h, jpeg_quality) {
             if let Ok(dec) = decode_jpeg_bytes(&jpeg_bytes, "jpeg round-trip") {
@@ -1797,7 +2576,7 @@ fn degrade_image_inner(
             art_mask.as_deref().map(|am| (am, art_w, art_h)),
         );
         if let Some(ref mut art) = m.artifacts {
-            realism::stamp_sheen_mask(art, params.width, params.height, &sheen);
+            realism::stamp_realism_masks(art, &params, &sheen, stand_ledge_px, &occluder);
         }
         Some(m)
     } else {
@@ -1958,6 +2737,7 @@ mod tests {
             scale_min: 1.0,
             toggles: StageToggles::default(),
             realism: RealismConfig::default(),
+            corner_detach: CornerDetachConfig::disabled(),
             masks: MaskRequest::none(),
         }
     }

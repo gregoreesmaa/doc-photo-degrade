@@ -112,25 +112,36 @@ pub fn bend_backward(xb: f64, yb: f64, w0: u32, h0: u32, params: &DegradeParams)
 ///   `< 1e-11 px`).
 /// - `"ripple"`: 2D Newton-Raphson with analytic 2x2 Jacobian (<= 12 iters,
 ///   `< 1e-10 px`).
-pub fn bend_forward_exact(
+///
+/// Exact `f64` forward page-bend map from raw bend parameters (usable before
+/// `DegradeParams` is constructed, e.g. to project `content_bbox` through bend
+/// before Stage 3 detached-corner clamping).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bend_forward_exact_raw(
     xs: f64,
     ys: f64,
     w0: u32,
     h0: u32,
-    params: &DegradeParams,
+    curl_side: &str,
+    curl_px_f32: f32,
+    bend_spine_cx: f32,
+    bend_spine_w: f32,
+    bend_ripple_fx: f32,
+    bend_ripple_fy: f32,
+    bend_ripple_ph: f32,
 ) -> (f64, f64) {
-    if params.curl_px <= 0.25 || w0 == 0 || h0 == 0 {
+    if curl_px_f32 <= 0.25 || w0 == 0 || h0 == 0 {
         return (xs, ys);
     }
     let wf = w0 as f64;
     let hf = h0 as f64;
-    let curl_px = params.curl_px as f64;
+    let curl_px = curl_px_f32 as f64;
 
-    match params.curl_side.as_str() {
+    match curl_side {
         "spine" => {
             let depth = ((curl_px / wf) * 2.0).min(0.15);
-            let spine_cx = params.bend_spine_cx as f64;
-            let spine_w = (params.bend_spine_w as f64).max(1.0);
+            let spine_cx = bend_spine_cx as f64;
+            let spine_w = (bend_spine_w as f64).max(1.0);
             let u_s = (xs - spine_cx) / spine_w;
             let mut u = u_s;
             for _ in 0..8 {
@@ -145,9 +156,9 @@ pub fn bend_forward_exact(
             (spine_cx + u * spine_w, ys)
         }
         "ripple" => {
-            let fx = params.bend_ripple_fx as f64;
-            let fy = params.bend_ripple_fy as f64;
-            let ph = params.bend_ripple_ph as f64;
+            let fx = bend_ripple_fx as f64;
+            let fy = bend_ripple_fy as f64;
+            let ph = bend_ripple_ph as f64;
             let ax = 0.5 * curl_px;
             let ay = 0.3 * curl_px;
             let kx = std::f64::consts::TAU * fx / hf;
@@ -207,6 +218,28 @@ pub fn bend_forward_exact(
             (wf * (1.0 - e), ys)
         }
     }
+}
+
+pub fn bend_forward_exact(
+    xs: f64,
+    ys: f64,
+    w0: u32,
+    h0: u32,
+    params: &DegradeParams,
+) -> (f64, f64) {
+    bend_forward_exact_raw(
+        xs,
+        ys,
+        w0,
+        h0,
+        &params.curl_side,
+        params.curl_px,
+        params.bend_spine_cx,
+        params.bend_spine_w,
+        params.bend_ripple_fx,
+        params.bend_ripple_fy,
+        params.bend_ripple_ph,
+    )
 }
 
 /// Precomputed geometric transform context for fast per-pixel forward/backward
@@ -384,6 +417,72 @@ impl<'a> ReprojectContext<'a> {
         } else {
             (xr, yr)
         }
+    }
+
+    /// Affine forward map from Stage-3 `persp` space -> final output pixel space.
+    #[inline]
+    pub(crate) fn persp_to_output(&self, mut px: f64, mut py: f64) -> (f64, f64) {
+        if self.params.frame_mode == "inset" {
+            px += self.params.frame_pad_px[0] as f64;
+            py += self.params.frame_pad_px[1] as f64;
+        } else if self.params.frame_mode == "tight" {
+            px -= self.params.frame_cut_px[0] as f64;
+            py -= self.params.frame_cut_px[1] as f64;
+        }
+
+        if self.rot_active {
+            let (cx0, cy0) = (self.fw as f64 / 2.0, self.fh as f64 / 2.0);
+            let (cx1, cy1) = (self.w_rot as f64 / 2.0, self.h_rot as f64 / 2.0);
+            let u = px - cx0;
+            let v = py - cy0;
+            px = cx1 + u * self.cst - v * self.snt;
+            py = cy1 + u * self.snt + v * self.cst;
+        }
+
+        if self.params.rot_scale_fused {
+            let sx = if self.params.scale_x > 0.0 {
+                self.params.scale_x as f64
+            } else {
+                1.0
+            };
+            let sy = if self.params.scale_y > 0.0 {
+                self.params.scale_y as f64
+            } else {
+                1.0
+            };
+            (px * sx, py * sy)
+        } else if self.params.width > 0
+            && self.params.height > 0
+            && (self.params.width != self.w_rot || self.params.height != self.h_rot)
+        {
+            let rx = self.params.width as f64 / self.w_rot as f64;
+            let ry = self.params.height as f64 / self.h_rot as f64;
+            ((px + 0.5) * rx - 0.5, (py + 0.5) * ry - 0.5)
+        } else {
+            (px, py)
+        }
+    }
+
+    /// Returns `(page_quad_out, frame_clip_out)` in final output pixel space (CW, y-down).
+    /// A pixel is on-page iff it lies inside BOTH convex quads.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn visible_page_quads_out(&self) -> ([(f64, f64); 4], [(f64, f64); 4]) {
+        let (wf, hf) = (self.w0 as f64, self.h0 as f64);
+        let src_c = [(0.0, 0.0), (wf, 0.0), (wf, hf), (0.0, hf)];
+        let mut q_out = [(0.0, 0.0); 4];
+        for i in 0..4 {
+            let dx = self.params.corner_offsets[i][0] as f64;
+            let dy = self.params.corner_offsets[i][1] as f64;
+            q_out[i] = self.persp_to_output(src_c[i].0 + dx, src_c[i].1 + dy);
+        }
+        let clip_rect = if self.params.frame_mode == "tight" {
+            let [cl, ct, cr, cb] = self.params.frame_cut_px.map(|v| v as f64);
+            [(cl, ct), (wf - cr, ct), (wf - cr, hf - cb), (cl, hf - cb)]
+        } else {
+            src_c
+        };
+        let r_out = clip_rect.map(|(x, y)| self.persp_to_output(x, y));
+        (q_out, r_out)
     }
 
     #[inline]
@@ -662,152 +761,40 @@ pub fn transform_polygon(poly: &[(f64, f64)], params: &DegradeParams) -> Vec<(f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CaptureParams, InkParams, PaperParams, WearParams};
+    use crate::CaptureParams;
 
     fn identity_params(w: u32, h: u32) -> DegradeParams {
         DegradeParams {
-            input: String::new(),
-            output: String::new(),
-            file_seed: 0,
-            strength: 0.0,
             backend: "cpu".to_string(),
             preset: "full".to_string(),
-            fast_banks: false,
             width: w,
             height: h,
-            train_width: 0,
             orig_width: w,
             orig_height: h,
             src_width: w,
             src_height: h,
             rescale_k: 1.0,
-            paper_grain_sigma: 0.0,
-            paper_speckle_prob: 0.0,
             curl_side: "left".to_string(),
-            curl_px: 0.0,
-            curl_shade: 0.0,
-            bend_spine_cx: 0.0,
-            bend_spine_w: 0.0,
-            bend_ripple_fx: 0.0,
-            bend_ripple_fy: 0.0,
-            bend_ripple_ph: 0.0,
-            perspective_max_frac: 0.0,
-            corner_offsets: [[0.0; 2]; 4],
             warp_fit_scale: 1.0,
-            warp_out_px: 0.0,
-            rotation_deg: 0.0,
-            rot_scale_fused: false,
             frame_mode: "inset".to_string(),
-            frame_pad_px: [0; 4],
-            frame_cut_px: [0; 4],
-            frame_content_bbox: [0; 4],
-            frame_quiet_px: [0; 4],
             frame_safe_px: 3,
-            dist_k1: 0.0,
-            dist_k2: 0.0,
             dist_fit_scale: 1.0,
             focus_mode: "uniform".to_string(),
             focus_y: 0.5,
             focus_h: 0.2,
-            tilt_sigma: 0.0,
-            blur_sigma: 0.0,
-            glare_center: [0.0, 0.0],
-            glare_radius: 0.0,
-            glare_alpha: 0.0,
-            shadow_angle_deg: 0.0,
-            shadow_strength: 0.0,
-            vignette_strength: 0.0,
-            ca_px: 0.0,
-            ink: InkParams {
-                enabled: false,
-                fade_amount: 0.0,
-                blotches: [[0.0; 4]; 3],
-                dropout_clusters: 0,
-                dropout_radius: 0.0,
-                gap_attempts: 0,
-                gap_max_len: 0,
-                ghost_alpha: 0.0,
-                ghost_radius: 0,
-                toner_amp: 0.0,
-                toner_fx: 0.0,
-                toner_fy: 0.0,
-                toner_phase: 0.0,
-                brown_amount: 0.0,
-            },
-            paper: PaperParams {
-                enabled: false,
-                yellowing: 0.0,
-                mottle: 0.0,
-                edge: 0.0,
-                foxing_spots: 0,
-                foxing_amount: 0.0,
-                fiber_strokes: 0,
-                fiber_amount: 0.0,
-                cockle: 0.0,
-                water_present: false,
-                water_x: 0.0,
-                water_y: 0.0,
-                water_radius: 0.0,
-                water_amount: 0.0,
-            },
-            wear: WearParams {
-                enabled: false,
-                heavy_zones: [[0.0; 4]; 3],
-                heavy_lift: 0.0,
-                flake_clusters: 0,
-                band_period: 0.0,
-                band_amp: 0.0,
-                streaks: 0,
-                toner_bands: 0,
-                misreg: [0, 0],
-                eraser_count: 0,
-                stain_water: false,
-                stain_oil: false,
-            },
             capture: CaptureParams {
-                enabled: false,
-                motion_angle_deg: 0.0,
-                motion_radius: 0,
-                fingerprint_edge: 0,
-                fingerprint_x: 0,
-                fingerprint_y: 0,
-                fingerprint_rx: 0,
-                fingerprint_ry: 0,
-                fingerprint_oil: 0.0,
-                tape_height: 0,
-                tape_opacity: 0.0,
-                tape_edge: 0,
-                tape_start_frac: 0.0,
-                tape_len_frac: 0.0,
-                residue_count: 0,
-                residue_rects: Vec::new(),
-                hole_x: 0,
-                hole_y: 0,
-                hole_radius: 0,
-                sticky_corner: 0,
-                sticky_size: 0,
-                sticky_tone: 0,
-                exposure_lift: 0.0,
                 exposure_compress: 1.0,
-                banding_amplitude: 0.0,
                 banding_period: 4,
+                ..CaptureParams::default()
             },
             scale_x: 1.0,
             scale_y: 1.0,
-            tear_count: 0,
-            stain_count: 0,
-            pencil_count: 0,
             fold_corner: "none".to_string(),
-            fold_creases: Vec::new(),
             highlight: "none".to_string(),
-            noise_sigma: 0.0,
             jpeg_quality: 100,
             codec: "zune".to_string(),
-            awb_warm_cool_strength: 0.0,
-            usm_strength: 0.0,
             desk_surface: "none".to_string(),
-            crumple_strength: 0.0,
-            sheen_strength: 0.0,
+            ..DegradeParams::default()
         }
     }
 
