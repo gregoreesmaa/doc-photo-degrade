@@ -1,0 +1,38 @@
+[package]
+name = "doc-photo-degrade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/doc-photo-degrade"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Realistic, deterministic document-to-phone-photo degradation pipeline (paper aging, ink wear, page curl, perspective, margin-safe framing, defocus, lighting, noise, JPEG) with optional WGPU acceleration."
+
+[features]
+default = ["gpu"]
+gpu = ["dep:doc-photo-degrade-gpu", "dep:pollster"]
+
+[lib]
+name = "doc_photo_degrade"
+path = "src/lib.rs"
+
+[[bin]]
+name = "doc-photo-degrade"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+doc-photo-degrade-gpu = { workspace = true, optional = true }
+fast_image_resize.workspace = true
+image.workspace = true
+jpeg-encoder.workspace = true
+pollster = { workspace = true, optional = true }
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zune-jpeg.workspace = true
+zune-png.workspace = true

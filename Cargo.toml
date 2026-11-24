@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/doc-photo-degrade",
+    "crates/doc-photo-degrade-gpu",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gregoreesmaa/doc-photo-degrade"
+homepage = "https://github.com/gregoreesmaa/doc-photo-degrade"
+readme = "README.md"
+keywords = ["ocr", "document-ai", "image-degradation", "wgpu", "synthetic-data"]
+categories = ["multimedia::images", "computer-vision"]
+
+[workspace.dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+doc-photo-degrade-gpu = { path = "crates/doc-photo-degrade-gpu", version = "0.1.0" }
+fast_image_resize = "6.1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
+pollster = "0.3"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "30"
+zune-jpeg = "0.5.15"
+zune-png = "0.5.2"

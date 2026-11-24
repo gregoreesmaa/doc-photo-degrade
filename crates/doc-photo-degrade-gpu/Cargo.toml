@@ -1,0 +1,17 @@
+[package]
+name = "doc-photo-degrade-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/doc-photo-degrade-gpu"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "WGPU compute backend for doc-photo-degrade dense stages (resident single-submit chain + fused rotate/downscale affine)."
+
+[dependencies]
+bytemuck.workspace = true
+pollster.workspace = true
+wgpu.workspace = true

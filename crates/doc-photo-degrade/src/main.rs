@@ -1,0 +1,405 @@
+//! `doc-photo-degrade` CLI: clean document PNG/JPEG -> realistic phone photo
+//! + paired JSON parameter sidecar.
+
+use clap::Parser;
+use doc_photo_degrade::{
+    collect_inputs, encode_jpeg, write_artifact, DegradeConfig, DocumentProfile, Preset,
+    StageToggles,
+};
+use image::ImageFormat;
+use std::path::PathBuf;
+
+/// Degrade clean document images into realistic phone photos with paired JSON
+/// parameter sidecars.
+#[derive(Parser, Debug)]
+#[command(name = "doc-photo-degrade", version, about)]
+struct Args {
+    /// Input clean PNG/JPEG file, or a directory of images (non-recursive).
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output directory receiving `<stem>{suffix}.png|jpg` + `<stem>{suffix}_params.json`.
+    #[arg(long, default_value = "out")]
+    out_dir: PathBuf,
+
+    /// Domain document profile: `phone-photo`, `archival-manuscript`,
+    /// `thermal-receipt`, `office-scan`, `photocopy-xerox`, `book-gutter-bend`,
+    /// or `sheet-music`. Explicit CLI flags override profile defaults.
+    #[arg(long)]
+    profile: Option<String>,
+
+    /// Pipeline preset: `full` or `reduced`.
+    #[arg(long)]
+    preset: Option<String>,
+
+    /// Master seed. For directory input, file `i` uses
+    /// `seed + i * 0x9E3779B97F4A7C15` (wrapping multiply stride).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// Global effect strength in `[0, 1]`. Scales every effect (default: 0.5, or profile default).
+    #[arg(long)]
+    strength: Option<f32>,
+
+    /// JPEG quality override (`1..=100`). If omitted, sampled per image (or profile default).
+    #[arg(long)]
+    jpeg_quality: Option<u8>,
+
+    /// Downscale inputs wider than this to this width (aspect kept, `0` = keep native).
+    #[arg(long, default_value_t = 2480)]
+    max_width: u32,
+
+    /// Degrade at model-training resolution: downscale post-maxwidth input to
+    /// this width before any degrade stage and rescale absolute-pixel stats by
+    /// `k = train_width / src_width`. `0` = off (full-res path).
+    #[arg(long, default_value_t = 0)]
+    train_width: u32,
+
+    /// Random output downscale per image, sampled uniformly in `[scale-min, 1.0]`
+    /// (`1.0` = keep; default: 0.5, or profile default).
+    #[arg(long)]
+    scale_min: Option<f32>,
+
+    /// Filename suffix for degraded images (before the extension).
+    #[arg(long, default_value = "_degraded")]
+    suffix: String,
+
+    /// Output image format: `png` (lossless) or `jpeg`.
+    #[arg(long, default_value = "png")]
+    format: String,
+
+    /// Require the WGPU GPU backend (fail if no usable GPU adapter is found or
+    /// if compiled without the `gpu` feature).
+    #[arg(long, default_value_t = false, conflicts_with = "cpu")]
+    gpu: bool,
+
+    /// Force the CPU backend for all stages (disables auto GPU acceleration).
+    #[arg(long, default_value_t = false)]
+    cpu: bool,
+
+    /// Skip the fine paper-grain stage.
+    #[arg(long, default_value_t = false)]
+    skip_grain: bool,
+
+    /// Skip the non-linear page-bend stage (enables exact projective/affine
+    /// bounding-box reprojection via `reproject`).
+    #[arg(long, default_value_t = false)]
+    skip_bend: bool,
+
+    /// Skip chromatic aberration (stream-preserving).
+    #[arg(long, default_value_t = false)]
+    skip_chromatic: bool,
+
+    /// Skip the sensor-noise stage.
+    #[arg(long, default_value_t = false)]
+    skip_noise: bool,
+
+    /// Coarsen ink degradation: keep dropout + broken strokes, skip smooth fade/toner/ghost field.
+    #[arg(long, default_value_t = false)]
+    coarsen_ink: bool,
+
+    /// Coarsen paper aging: keep foxing spots + fibers, skip full-frame tint/mottle/water loop.
+    #[arg(long, default_value_t = false)]
+    coarsen_aging: bool,
+
+    /// Reduced pipeline preset (`--skip-grain --skip-chromatic --skip-noise --coarsen-ink --coarsen-aging`).
+    #[arg(long, default_value_t = false)]
+    reduced: bool,
+
+    /// Precomputed fast path: seeded tiled Gaussian banks + precomputed lighting field.
+    #[arg(long, default_value_t = false)]
+    fast_banks: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+    if let Err(e) = run(&args) {
+        eprintln!("doc-photo-degrade: error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &Args) -> Result<(), String> {
+    let fmt = match args.format.to_ascii_lowercase().as_str() {
+        "png" => ImageFormat::Png,
+        "jpeg" | "jpg" => ImageFormat::Jpeg,
+        other => return Err(format!("--format must be png|jpeg, got `{other}`")),
+    };
+    let ext = match fmt {
+        ImageFormat::Jpeg => "jpg",
+        _ => "png",
+    };
+    let mut base_cfg = DegradeConfig {
+        seed: args.seed,
+        max_width: args.max_width,
+        train_width: args.train_width,
+        ..DegradeConfig::default()
+    };
+
+    let selected_profile = if let Some(ref name) = args.profile {
+        let p = DocumentProfile::from_str_name(name).ok_or_else(|| {
+            let valid = DocumentProfile::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("--profile must be one of [{valid}], got `{name}`")
+        })?;
+        p.apply_to_config(&mut base_cfg);
+        Some(p)
+    } else {
+        None
+    };
+
+    if let Some(ref preset_name) = args.preset {
+        let preset = match preset_name.trim().to_ascii_lowercase().as_str() {
+            "full" => Preset::Full,
+            "reduced" => Preset::Reduced,
+            other => return Err(format!("--preset must be full|reduced, got `{other}`")),
+        };
+        let fb = base_cfg.toggles.fast_banks;
+        base_cfg = base_cfg.with_preset(preset);
+        base_cfg.toggles.fast_banks = fb;
+    }
+
+    if let Some(s) = args.strength {
+        base_cfg.strength = s.clamp(0.0, 1.0);
+    }
+    if let Some(sm) = args.scale_min {
+        base_cfg.scale_min = sm;
+    }
+    if let Some(q) = args.jpeg_quality {
+        base_cfg.jpeg_quality = Some(q);
+    }
+    if args.reduced {
+        let fb = base_cfg.toggles.fast_banks;
+        base_cfg.toggles = StageToggles::reduced();
+        base_cfg.toggles.fast_banks = fb;
+    }
+    base_cfg.toggles.skip_grain |= args.skip_grain;
+    base_cfg.toggles.skip_bend |= args.skip_bend;
+    base_cfg.toggles.skip_chromatic |= args.skip_chromatic;
+    base_cfg.toggles.skip_noise |= args.skip_noise;
+    base_cfg.toggles.coarsen_ink |= args.coarsen_ink;
+    base_cfg.toggles.coarsen_aging |= args.coarsen_aging;
+    if args.fast_banks {
+        base_cfg.toggles.fast_banks = true;
+    }
+    base_cfg.validate()?;
+
+    let inputs = collect_inputs(&args.input)?;
+    if inputs.is_empty() {
+        return Err(format!(
+            "no PNG/JPEG files found at {}",
+            args.input.display()
+        ));
+    }
+    std::fs::create_dir_all(&args.out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", args.out_dir.display()))?;
+
+    #[cfg(feature = "gpu")]
+    let gpu = init_gpu(args)?;
+    #[cfg(not(feature = "gpu"))]
+    if args.gpu {
+        return Err("--gpu requested, but this binary was built without the `gpu` feature".into());
+    }
+
+    if let Some(p) = selected_profile {
+        println!("document profile: {}", p.as_str());
+    }
+    if base_cfg.toggles.preset_name() != "full" {
+        println!("pipeline preset: {}", base_cfg.toggles.preset_name());
+    }
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1)
+        .min(inputs.len().max(1));
+    let chunk_size = inputs.len().div_ceil(n_threads);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let first_err = std::sync::Mutex::new(None::<String>);
+    let print_lock = std::sync::Mutex::new(());
+    let (stop_r, err_r, pl_r) = (&stop, &first_err, &print_lock);
+    let base_cfg_r = &base_cfg;
+    #[cfg(feature = "gpu")]
+    let gpu_r = gpu.as_ref();
+
+    std::thread::scope(|scope| {
+        for (ci, chunk) in inputs.chunks(chunk_size).enumerate() {
+            let base = ci * chunk_size;
+            scope.spawn(move || {
+                for (j, path) in chunk.iter().enumerate() {
+                    if stop_r.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = base + j;
+                    let file_seed = args
+                        .seed
+                        .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    let mut cfg = base_cfg_r.clone();
+                    cfg.seed = file_seed;
+
+                    #[cfg(feature = "gpu")]
+                    let res = doc_photo_degrade::degrade_file_gpu(path, &cfg, gpu_r);
+                    #[cfg(not(feature = "gpu"))]
+                    let res = doc_photo_degrade::degrade_file(path, &cfg);
+
+                    match res {
+                        Ok(mut out) => {
+                            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                                Some(s) => s.to_string(),
+                                None => {
+                                    stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    *err_r.lock().unwrap() =
+                                        Some(format!("bad file name: {}", path.display()));
+                                    break;
+                                }
+                            };
+                            let img_name = format!("{stem}{}.{ext}", args.suffix);
+                            let json_name = format!("{stem}{}_params.json", args.suffix);
+                            let img_path = args.out_dir.join(&img_name);
+                            let json_path = args.out_dir.join(&json_name);
+
+                            let write_res = if fmt == ImageFormat::Jpeg {
+                                match encode_jpeg(&out.image, out.params.jpeg_quality) {
+                                    Ok(buf) => write_artifact(&img_path, |p| {
+                                        std::fs::write(p, &buf).map_err(|e| {
+                                            format!("cannot write {}: {e}", p.display())
+                                        })
+                                    })
+                                    .map(|()| "zune"),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                write_artifact(&img_path, |p| {
+                                    out.image
+                                        .save_with_format(p, fmt)
+                                        .map_err(|e| format!("cannot write {}: {e}", p.display()))
+                                })
+                                .map(|()| "image")
+                            };
+
+                            match write_res {
+                                Ok(tag) => out.params.codec = tag.to_string(),
+                                Err(e) => {
+                                    stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    *err_r.lock().unwrap() = Some(e);
+                                    break;
+                                }
+                            }
+                            out.params.output = img_name;
+                            let json = match serde_json::to_string_pretty(&out.params)
+                                .map_err(|e| format!("cannot serialize params: {e}"))
+                            {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    *err_r.lock().unwrap() = Some(e);
+                                    break;
+                                }
+                            };
+                            if let Err(e) = write_artifact(&json_path, |p| {
+                                std::fs::write(p, json.clone() + "\n")
+                                    .map_err(|e| format!("cannot write {}: {e}", p.display()))
+                            }) {
+                                stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                                *err_r.lock().unwrap() = Some(e);
+                                break;
+                            }
+                            let _guard = pl_r.lock().unwrap();
+                            println!("{} -> {}", path.display(), img_path.display());
+                            println!("  params -> {}", json_path.display());
+                        }
+                        Err(e) => {
+                            stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                            *err_r.lock().unwrap() = Some(format!("{}: {e}", path.display()));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = err_r.lock().unwrap().take() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn init_gpu(args: &Args) -> Result<Option<doc_photo_degrade::Gpu>, String> {
+    if args.cpu {
+        return Ok(None);
+    }
+    match doc_photo_degrade::Gpu::new() {
+        Ok(g) => {
+            println!("GPU backend enabled");
+            // Warm up pipelines once so steady-state timing is clean.
+            let tiny = vec![128.0f32; 8 * 8 * 3];
+            let _ = g.grain(&tiny, 8, 8, 3.0, 1, 0.001, 0.5, [4.0, 2.0, -1.0]);
+            let (rows, meta, _, _, nw, nh) =
+                doc_photo_degrade::gpu_backend::rotscale_frame(2.0, 8, 8, 0.9, 0.9);
+            let _ = g.chain(
+                &tiny,
+                8,
+                8,
+                &doc_photo_degrade_gpu::chain::ChainConfig {
+                    grain_sigma: 3.0,
+                    grain_seed: 1,
+                    grain_speckle_prob: 0.001,
+                    grain_strength: 0.5,
+                    grain_warm: [4.0, 2.0, -1.0],
+                    bend: doc_photo_degrade_gpu::gpu::BendKnobs {
+                        mode: 2,
+                        edge_id: 0,
+                        curl_px: 1.0,
+                        curl_shade: 0.1,
+                        spine_cx: 4.0,
+                        spine_w: 1.0,
+                        depth: 0.05,
+                        rip_fx: 1.5,
+                        rip_fy: 1.2,
+                        rip_ph: 0.3,
+                    },
+                    persp_inv: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    rot_deg: 2.0,
+                    blur_sigma: 1.5,
+                    light: doc_photo_degrade_gpu::gpu::LightingKnobs {
+                        gx: 4.0,
+                        gy: 4.0,
+                        glare_radius: 20.0,
+                        glare_alpha: 0.1,
+                        sh_dx: 1.0,
+                        sh_dy: 0.0,
+                        shadow_strength: 0.1,
+                        vignette_strength: 0.1,
+                    },
+                    ca_px: 0.5,
+                    noise_sigma: 5.0,
+                    noise_seed: 7,
+                    run_grain: true,
+                    run_bend: true,
+                    run_persp: true,
+                    run_rot: true,
+                    run_blur: true,
+                    run_light: true,
+                    run_ca: true,
+                    run_noise: true,
+                    tilt_active: false,
+                    focus_y: 0.0,
+                    focus_h: 0.0,
+                    run_affine: true,
+                    affine_rows: rows,
+                    affine_meta: meta,
+                    affine_nw: nw.max(1),
+                    affine_nh: nh.max(1),
+                },
+            );
+            Ok(Some(g))
+        }
+        Err(e) if args.gpu => Err(format!("--gpu: {e}")),
+        Err(_) => Ok(None),
+    }
+}
