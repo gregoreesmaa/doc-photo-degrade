@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish --dry-run instead of publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-crates:
+    name: Verify & Publish to crates.io
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches workspace version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          WS_VER="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          echo "Tag version: $TAG_VER | Workspace version: $WS_VER"
+          if [ "$TAG_VER" != "$WS_VER" ]; then
+            echo "::error::Tag v$TAG_VER does not match Cargo.toml version $WS_VER"
+            exit 1
+          fi
+
+      - name: Verify fmt, clippy, CPU tests, and rustdoc
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p doc-photo-degrade --no-default-features -- -D warnings
+          cargo test -p doc-photo-degrade --no-default-features -- --test-threads=4
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --no-default-features
+
+      - name: Publish doc-photo-degrade-gpu then doc-photo-degrade
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::Dry-run enabled; running cargo publish --dry-run"
+            cargo publish -p doc-photo-degrade-gpu --dry-run
+            exit 0
+          fi
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set"
+            exit 1
+          fi
+          cargo publish -p doc-photo-degrade-gpu --token "$CARGO_REGISTRY_TOKEN"
+          echo "Waiting 30s for crates.io index propagation..."
+          sleep 30
+          cargo publish -p doc-photo-degrade --token "$CARGO_REGISTRY_TOKEN"
+
+  build-binaries:
+    name: Build Release Binary (${{ matrix.target }})
+    needs: publish-crates
+    if: github.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: doc-photo-degrade
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: doc-photo-degrade.exe
+            ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: doc-photo-degrade
+            ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p doc-photo-degrade --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/doc-photo-degrade-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "${{ matrix.bin }}"
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target\${{ matrix.target }}\release\${{ matrix.bin }}" `
+            -DestinationPath "dist\doc-photo-degrade-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/*
+
+  github-release:
+    name: Create GitHub Release
+    needs: build-binaries
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

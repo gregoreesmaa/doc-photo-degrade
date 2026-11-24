@@ -3,8 +3,8 @@
 
 use clap::Parser;
 use doc_photo_degrade::{
-    collect_inputs, encode_jpeg, write_artifact, DegradeConfig, DocumentProfile, Preset,
-    StageToggles,
+    collect_inputs, encode_jpeg, write_artifact, DegradeConfig, DocumentProfile, MaskFormat,
+    MaskRequest, Preset, StageToggles,
 };
 use image::ImageFormat;
 use std::path::PathBuf;
@@ -109,6 +109,15 @@ struct Args {
     /// Precomputed fast path: seeded tiled Gaussian banks + precomputed lighting field.
     #[arg(long, default_value_t = false)]
     fast_banks: bool,
+
+    /// Export multi-task ground-truth masks alongside each degraded image
+    /// (`uv_flow`, `illumination`, `clean_ink`, `artifacts`).
+    #[arg(long, default_value_t = false)]
+    export_masks: bool,
+
+    /// Format for exported floating-point masks: `npy-png` (default) or `png16`.
+    #[arg(long, default_value = "npy-png")]
+    mask_format: String,
 }
 
 fn main() {
@@ -184,6 +193,15 @@ fn run(args: &Args) -> Result<(), String> {
     base_cfg.toggles.coarsen_aging |= args.coarsen_aging;
     if args.fast_banks {
         base_cfg.toggles.fast_banks = true;
+    }
+    let mask_fmt = MaskFormat::from_str_name(&args.mask_format).ok_or_else(|| {
+        format!(
+            "--mask-format must be npy-png|png16, got `{}`",
+            args.mask_format
+        )
+    })?;
+    if args.export_masks {
+        base_cfg.masks = MaskRequest::all();
     }
     base_cfg.validate()?;
 
@@ -307,9 +325,25 @@ fn run(args: &Args) -> Result<(), String> {
                                 *err_r.lock().unwrap() = Some(e);
                                 break;
                             }
+                            let mask_paths = if let Some(ref masks) = out.masks {
+                                let prefix = format!("{stem}{}", args.suffix);
+                                match masks.write_to_dir(&args.out_dir, &prefix, mask_fmt) {
+                                    Ok(paths) => paths,
+                                    Err(e) => {
+                                        stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        *err_r.lock().unwrap() = Some(e);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
                             let _guard = pl_r.lock().unwrap();
                             println!("{} -> {}", path.display(), img_path.display());
                             println!("  params -> {}", json_path.display());
+                            for mp in mask_paths {
+                                println!("  mask   -> {}", mp.display());
+                            }
                         }
                         Err(e) => {
                             stop_r.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -375,9 +409,13 @@ fn init_gpu(args: &Args) -> Result<Option<doc_photo_degrade::Gpu>, String> {
                         sh_dy: 0.0,
                         shadow_strength: 0.1,
                         vignette_strength: 0.1,
+                        awb_dx: 1.0,
+                        awb_dy: 0.0,
+                        awb_strength: 0.0,
                     },
                     ca_px: 0.5,
                     noise_sigma: 5.0,
+                    noise_shot_sigma: 0.0,
                     noise_seed: 7,
                     run_grain: true,
                     run_bend: true,

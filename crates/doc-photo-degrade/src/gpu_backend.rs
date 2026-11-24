@@ -133,6 +133,9 @@ impl Gpu {
                 sh_dy: theta.sin(),
                 shadow_strength,
                 vignette_strength,
+                awb_dx: 1.0,
+                awb_dy: 0.0,
+                awb_strength: 0.0,
             },
         )
     }

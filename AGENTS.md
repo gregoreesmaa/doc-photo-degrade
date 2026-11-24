@@ -13,8 +13,10 @@ Two-crate Cargo workspace (`resolver = "2"`, Rust 2021, `MIT OR Apache-2.0`). `d
 | `Cargo.toml` | Workspace manifest and shared dependency versions |
 | `crates/doc-photo-degrade/src/lib.rs` | 10-stage pipeline orchestrator, `DegradeConfig`, `DegradeParams`, `Preset`, `StageToggles`, `BackendPreference` |
 | `crates/doc-photo-degrade/src/main.rs` | Multi-threaded `doc-photo-degrade` CLI driver, profile/preset flag parsing, shared GPU warmup |
-| `crates/doc-photo-degrade/src/degrader.rs` | Ergonomic `Degrader` / `DegraderBuilder`, 7 `DocumentProfile` presets, `DegradeError`, batch helpers |
-| `crates/doc-photo-degrade/src/reproject.rs` | Forward-projection of points, bounding boxes, and polygons from `DegradeParams` |
+| `crates/doc-photo-degrade/src/degrader.rs` | Ergonomic `Degrader` / `DegraderBuilder`, 7 `DocumentProfile` presets, `DegradeError`, parallel `degrade_batch` |
+| `crates/doc-photo-degrade/src/reproject.rs` | Exact non-linear bend + projective forward/backward coordinate reprojection (`< 0.2 px` rendered error) |
+| `crates/doc-photo-degrade/src/masks.rs` | Multi-task GT mask export (`uv_flow`, `illumination`, `clean_ink`, `artifacts` bitmask, `.npy` v1.0 & `png16`) |
+| `crates/doc-photo-degrade/src/realism.rs` | Wave 2 photorealism (`RealismConfig`, mixed-illuminant AWB, USM haloing, procedural desk + contact shadow, 3D paper crumple shading, sheet-protector sheen) |
 | `crates/doc-photo-degrade/src/geometry.rs` | Margin-safe `content_bbox`, `quiet_margins`, crop/pad framing, homography, tear-free `spine_map`, `ink_grid` |
 | `crates/doc-photo-degrade/src/paper.rs` | Paper aging (yellowing, mottling, foxing spots, fibers, cockling, water damage) |
 | `crates/doc-photo-degrade/src/ink.rs` | Ink wear (fading, dropout, broken strokes, bleed-through, toner variation) |

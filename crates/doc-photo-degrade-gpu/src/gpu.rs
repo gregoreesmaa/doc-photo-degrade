@@ -256,7 +256,8 @@ pub struct GpuContext {
     affine_pipeline: wgpu::ComputePipeline,
 }
 
-/// Knobs for lighting stage 5: glare disc, shadow direction, vignette.
+/// Knobs for lighting stage 5: glare disc, shadow direction, vignette,
+/// and optional mixed-illuminant AWB warm-to-cool gradient.
 #[derive(Clone, Copy)]
 pub struct LightingKnobs {
     pub gx: f32,
@@ -268,6 +269,10 @@ pub struct LightingKnobs {
     pub sh_dy: f32,
     pub shadow_strength: f32,
     pub vignette_strength: f32,
+    /// Mixed-illuminant AWB gradient axis unit vector + strength (`0.0` = off).
+    pub awb_dx: f32,
+    pub awb_dy: f32,
+    pub awb_strength: f32,
 }
 
 /// Knobs for the stage-1 paper grain field.
@@ -648,9 +653,9 @@ impl GpuContext {
             cy,
             diag,
             max_d,
-            0.0,
-            0.0,
-            0.0,
+            k.awb_dx,
+            k.awb_dy,
+            k.awb_strength,
             0.0,
         ];
         run_pointwise(
@@ -1051,9 +1056,9 @@ impl GpuContext {
                     hf / 2.0,
                     (wf * wf + hf * hf).sqrt().max(1.0),
                     ((wf / 2.0).powi(2) + (hf / 2.0).powi(2)).sqrt().max(1.0),
-                    0.0,
-                    0.0,
-                    0.0,
+                    k.awb_dx,
+                    k.awb_dy,
+                    k.awb_strength,
                     0.0,
                 ];
                 let src = if head { &up } else { &pong };
@@ -1093,12 +1098,12 @@ impl GpuContext {
                 std::mem::swap(&mut ping, &mut pong);
                 head = false;
             }
-            // 8. sensor noise. Packing mirrors `noise()`.
+            // 8. sensor noise (read + optional Poisson shot noise). Packing mirrors `noise()`.
             if cfg.run_noise {
                 let prm = [
                     cfg.noise_sigma,
                     f32::from_bits(cfg.noise_seed),
-                    0.0,
+                    cfg.noise_shot_sigma,
                     0.0,
                     0.0,
                     0.0,
@@ -1478,15 +1483,21 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (x >= dims.dst_w || y >= dims.dst_h) { return; }
     let sigma = prm.a.x;
     let seed = bitcast<u32>(prm.a.y);
+    let sigma_shot = prm.a.z;
     // One independent Irwin-Hall-4 Gaussian per channel (12 taps/pixel,
     // base b = 0: R taps 0-3, G taps 4-7, B taps 8-11).
     let g0 = ih4(seed, x, y, 0u);
     let g1 = ih4(seed, x, y, 4u);
     let g2 = ih4(seed, x, y, 8u);
     let i = (y * dims.src_w + x) * 3u;
-    dst[i] = clamp(src[i] + g0 * sigma, 0.0, 255.0);
-    dst[i + 1u] = clamp(src[i + 1u] + g1 * sigma, 0.0, 255.0);
-    dst[i + 2u] = clamp(src[i + 2u] + g2 * sigma, 0.0, 255.0);
+    var eff_sigma = sigma;
+    if (sigma_shot > 0.0) {
+        let luma = max((src[i] + src[i + 1u] + src[i + 2u]) / (3.0 * 255.0), 0.01);
+        eff_sigma = sqrt(sigma * sigma + sigma_shot * sigma_shot * luma);
+    }
+    dst[i] = clamp(src[i] + g0 * eff_sigma, 0.0, 255.0);
+    dst[i + 1u] = clamp(src[i + 1u] + g1 * eff_sigma, 0.0, 255.0);
+    dst[i + 2u] = clamp(src[i + 2u] + g2 * eff_sigma, 0.0, 255.0);
 }
 "#;
 
@@ -1570,10 +1581,21 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cd = sqrt(cdx * cdx + cdy * cdy) / max(prm.c.w, 1e-6);
     let vig = 1.0 - prm.b.w * cd * cd;
     let m = max(shadow * vig, 0.0);
+    let awb_s = prm.d.z;
+    var mr = m;
+    var mg = m;
+    var mb = m;
+    if (awb_s > 0.0) {
+        let awb_t = clamp(((fx - prm.c.x) * prm.d.x + (fy - prm.c.y) * prm.d.y) / max(prm.c.z, 1e-6), -0.5, 0.5) * 2.0;
+        let awb = awb_s * awb_t;
+        mr = m * (1.0 + 0.14 * awb);
+        mg = m * (1.0 + 0.02 * awb);
+        mb = m * (1.0 - 0.16 * awb);
+    }
     let i = (y * dims.src_w + x) * 3u;
-    dst[i] = clamp(src[i] * m + add, 0.0, 255.0);
-    dst[i + 1u] = clamp(src[i + 1u] * m + add, 0.0, 255.0);
-    dst[i + 2u] = clamp(src[i + 2u] * m + add, 0.0, 255.0);
+    dst[i] = clamp(src[i] * mr + add, 0.0, 255.0);
+    dst[i + 1u] = clamp(src[i + 1u] * mg + add, 0.0, 255.0);
+    dst[i + 2u] = clamp(src[i + 2u] * mb + add, 0.0, 255.0);
 }
 "#;
 
@@ -2044,6 +2066,9 @@ mod tests {
             sh_dy: 0.0,
             shadow_strength: 0.0,
             vignette_strength: 0.0,
+            awb_dx: 1.0,
+            awb_dy: 0.0,
+            awb_strength: 0.0,
         };
         let gpu = ctx.lighting(&src, w, h, zero);
         assert!(
@@ -2070,6 +2095,9 @@ mod tests {
             sh_dy: th.sin(),
             shadow_strength: 0.24,
             vignette_strength: 0.1,
+            awb_dx: 1.0,
+            awb_dy: 0.0,
+            awb_strength: 0.0,
         };
         let gpu = ctx.lighting(&src, w, h, k);
         let cpu = cpu_lighting(&src, w, h, k);
@@ -2118,6 +2146,9 @@ mod tests {
                 sh_dy: th.sin(),
                 shadow_strength: 0.24,
                 vignette_strength: 0.1,
+                awb_dx: 1.0,
+                awb_dy: 0.0,
+                awb_strength: 0.0,
             },
             ca_px: 0.8,
             noise_sigma: 6.0,

@@ -24,7 +24,10 @@ use std::str::FromStr;
 
 use image::RgbImage;
 
-use crate::{BackendPreference, DegradeConfig, DegradeResult, Preset, StageToggles};
+use crate::{
+    BackendPreference, DegradeConfig, DegradeResult, MaskRequest, Preset, RealismConfig,
+    StageToggles,
+};
 
 #[cfg(feature = "gpu")]
 use crate::gpu_backend::Gpu;
@@ -168,6 +171,7 @@ impl DocumentProfile {
                 cfg.scale_min = 0.5;
                 cfg.jpeg_quality = None;
                 cfg.toggles = StageToggles::full();
+                cfg.realism = RealismConfig::phone();
             }
             DocumentProfile::ArchivalManuscript => {
                 cfg.strength = 0.75;
@@ -181,6 +185,14 @@ impl DocumentProfile {
                     coarsen_ink: false,
                     coarsen_aging: false,
                     fast_banks,
+                };
+                cfg.realism = RealismConfig {
+                    enable_awb: true,
+                    enable_shot_noise: true,
+                    enable_usm: false,
+                    enable_desk_surface: true,
+                    enable_crumple: true,
+                    enable_sheen: false,
                 };
             }
             DocumentProfile::ThermalReceipt => {
@@ -196,6 +208,14 @@ impl DocumentProfile {
                     coarsen_aging: true,
                     fast_banks,
                 };
+                cfg.realism = RealismConfig {
+                    enable_awb: true,
+                    enable_shot_noise: true,
+                    enable_usm: true,
+                    enable_desk_surface: true,
+                    enable_crumple: true,
+                    enable_sheen: false,
+                };
             }
             DocumentProfile::OfficeScan => {
                 cfg.strength = 0.20;
@@ -210,6 +230,7 @@ impl DocumentProfile {
                     coarsen_aging: true,
                     fast_banks,
                 };
+                cfg.realism = RealismConfig::flat_scanner();
             }
             DocumentProfile::PhotocopyXerox => {
                 cfg.strength = 0.65;
@@ -224,12 +245,21 @@ impl DocumentProfile {
                     coarsen_aging: true,
                     fast_banks,
                 };
+                cfg.realism = RealismConfig::flat_scanner();
             }
             DocumentProfile::BookGutterBend => {
                 cfg.strength = 0.60;
                 cfg.scale_min = 0.60;
                 cfg.jpeg_quality = None;
                 cfg.toggles = StageToggles::full();
+                cfg.realism = RealismConfig {
+                    enable_awb: true,
+                    enable_shot_noise: true,
+                    enable_usm: true,
+                    enable_desk_surface: true,
+                    enable_crumple: true,
+                    enable_sheen: false,
+                };
             }
             DocumentProfile::SheetMusic => {
                 cfg.strength = 0.45;
@@ -244,6 +274,7 @@ impl DocumentProfile {
                     coarsen_aging: false,
                     fast_banks,
                 };
+                cfg.realism = RealismConfig::phone();
             }
         }
         cfg.toggles.fast_banks = fast_banks;
@@ -341,14 +372,54 @@ impl Degrader {
         }
     }
 
-    /// Degrade a slice of images using independent golden-ratio derived seeds:
+    /// Degrade a slice of images in parallel across available CPU cores using
+    /// independent golden-ratio derived seeds:
     /// `base_seed.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))`.
+    ///
+    /// Preserves exact input order and bit-identical per-item determinism
+    /// regardless of thread scheduling.
     pub fn degrade_batch(&self, images: &[&RgbImage]) -> Result<Vec<DegradeResult>, DegradeError> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
         let base_seed = self.config.seed;
+        if images.len() == 1 {
+            return Ok(vec![self.degrade_image(images[0], base_seed)?]);
+        }
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1)
+            .min(images.len());
+        let chunk_size = images.len().div_ceil(n_threads);
+        let mut chunk_results: Vec<Result<Vec<DegradeResult>, DegradeError>> =
+            Vec::with_capacity(n_threads);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(n_threads);
+            for (ci, chunk) in images.chunks(chunk_size).enumerate() {
+                let base = ci * chunk_size;
+                handles.push(scope.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for (j, img) in chunk.iter().enumerate() {
+                        let i = base + j;
+                        let item_seed =
+                            base_seed.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_U64));
+                        local.push(self.degrade_image(img, item_seed)?);
+                    }
+                    Ok(local)
+                }));
+            }
+            for h in handles {
+                chunk_results.push(h.join().unwrap_or_else(|_| {
+                    Err(DegradeError::Processing("worker thread panicked".into()))
+                }));
+            }
+        });
+
         let mut out = Vec::with_capacity(images.len());
-        for (i, img) in images.iter().enumerate() {
-            let item_seed = base_seed.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_U64));
-            out.push(self.degrade_image(img, item_seed)?);
+        for res in chunk_results {
+            out.extend(res?);
         }
         Ok(out)
     }
@@ -368,6 +439,7 @@ pub struct DegraderBuilder {
     preset: Option<Preset>,
     toggles: Option<StageToggles>,
     fast_banks: Option<bool>,
+    masks: MaskRequest,
 }
 
 impl Default for DegraderBuilder {
@@ -384,6 +456,7 @@ impl Default for DegraderBuilder {
             preset: None,
             toggles: None,
             fast_banks: None,
+            masks: MaskRequest::none(),
         }
     }
 }
@@ -456,12 +529,19 @@ impl DegraderBuilder {
         self
     }
 
+    /// Configure multi-task ground-truth mask export (default: [`MaskRequest::none()`]).
+    pub fn export_masks(mut self, masks: MaskRequest) -> Self {
+        self.masks = masks;
+        self
+    }
+
     /// Validate configuration, initialize the requested backend, and construct a [`Degrader`].
     pub fn build(self) -> Result<Degrader, DegradeError> {
         let mut cfg = DegradeConfig {
             seed: self.seed,
             max_width: self.max_width,
             train_width: self.train_width.unwrap_or(0),
+            masks: self.masks,
             ..DegradeConfig::default()
         };
 
@@ -650,18 +730,21 @@ mod tests {
         assert_eq!(r1.params.backend, "cpu");
 
         let batch = degrader
-            .degrade_batch(&[&img, &img, &img])
+            .degrade_batch(&[&img, &img, &img, &img, &img, &img])
             .expect("batch degrade");
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].params.file_seed, 42);
-        assert_eq!(
-            batch[1].params.file_seed,
-            42u64.wrapping_add(GOLDEN_RATIO_U64)
-        );
-        assert_eq!(
-            batch[2].params.file_seed,
-            42u64.wrapping_add(2u64.wrapping_mul(GOLDEN_RATIO_U64))
-        );
+        assert_eq!(batch.len(), 6);
+        for (i, item) in batch.iter().enumerate() {
+            let expected_seed = 42u64.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_U64));
+            assert_eq!(item.params.file_seed, expected_seed);
+            let single = degrader
+                .degrade_image(&img, expected_seed)
+                .expect("sequential parity");
+            assert_eq!(
+                item.image.as_raw(),
+                single.image.as_raw(),
+                "parallel batch item {i} must be bit-identical to sequential degrade_image"
+            );
+        }
         assert_ne!(batch[0].image.as_raw(), batch[1].image.as_raw());
     }
 

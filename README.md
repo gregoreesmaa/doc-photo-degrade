@@ -11,10 +11,32 @@ Modern OCR, layout analysis, and document-AI models don't fail on clean digital 
 
 `doc-photo-degrade` solves all three problems at once:
 
-- **Physical realism across 10 ordered stages** — paper grain & aging, ink wear & bleed-through, tear-free page curl/spine/ripple, homography perspective, canvas-expanding rotation, ink-aware physical artifacts, heavy wear, defocus/tilt-shift blur, lighting & chromatic aberration, capture/handling defects, sensor noise, and JPEG round-trip.
+- **Physical realism across 10+ ordered stages** — paper grain & aging, ink wear & bleed-through, coupled 3D paper crumpling normal shading, tear-free page curl/spine/ripple, homography perspective, canvas-expanding rotation, ink-aware physical artifacts, heavy wear, defocus/tilt-shift blur, mixed-illuminant warm-to-cool AWB lighting & chromatic aberration, capture/handling defects, smartphone HDR unsharp-mask (USM) haloing, Poisson-Gaussian sensor noise, procedural desk surfaces (`walnut`, `slate`, `cloth`) with soft page contact drop-shadows, occasional plastic sheet-protector glare bands, and `4:2:0` JPEG round-trip.
 - **Mathematically margin-safe geometry** — perspective corners, tight crops, and sparse damage are clamped to measured quiet margins so document content is never clipped out of frame.
-- **Exact JSON provenance & label reprojection** — every degraded image is paired with a structured `DegradeParams` JSON sidecar recording every sampled knob and geometric transform; `transform_point_linear`, `transform_bbox`, and `transform_polygon` forward-project labels through perspective + framing + rotation + downscale (exact when page bend is disabled, e.g. `OfficeScan`/`PhotocopyXerox` or `--skip-bend`).
-- **Deterministic & fast** — multi-threaded Rust + SIMD codecs (`zune-png`, `zune-jpeg`, `jpeg-encoder`, `fast_image_resize`) + two-segment resident WGPU compute chains, with automatic, panic-free CPU fallback.
+- **Exact JSON provenance, non-linear label reprojection & GT masks** — every degraded image is paired with a structured `DegradeParams` JSON sidecar; `transform_point_exact`, `unproject_point_exact`, `transform_bbox_exact`, and `transform_polygon_exact` map coordinates through **all 5 geometric stages including non-linear page bend** (`< 0.2 px` rendered centroid accuracy, `< 1e-9 px` algebraic round-trip), and `--export-masks` emits pixel-aligned UV flow, illumination, clean-ink, and artifact bitmasks for multi-task training.
+- **Deterministic & fast** — multi-threaded Rust + SIMD codecs (`zune-png`, `zune-jpeg`, `jpeg-encoder` with true `4:2:0` chroma subsampling, `fast_image_resize`) + two-segment resident WGPU compute chains, with automatic, panic-free CPU fallback.
+
+---
+
+## Visual Examples (All 7 Profiles)
+
+All renders below were generated with `--strength 0.65 --format jpeg --max-width 1240 --seed 42` directly by the `doc-photo-degrade` CLI (resized for compact README display).
+
+### Before / After & Multi-Task Ground-Truth Masks (`phone-photo`)
+
+| Clean Source | `phone-photo` Degraded | GT Illumination Field (`_illum.png`) | GT Clean Ink Mask (`_ink.png`) |
+| :---: | :---: | :---: | :---: |
+| ![Clean Invoice](docs/images/clean_invoice.png) | ![Phone Photo](docs/images/profile_phone-photo.jpg) | ![Illumination Mask](docs/images/mask_illum.png) | ![Clean Ink Mask](docs/images/mask_ink.png) |
+
+### All 7 Built-in Document Profiles
+
+| `archival-manuscript` | `thermal-receipt` | `office-scan` | `photocopy-xerox` |
+| :---: | :---: | :---: | :---: |
+| ![Archival Manuscript](docs/images/profile_archival-manuscript.jpg) | ![Thermal Receipt](docs/images/profile_thermal-receipt.jpg) | ![Office Scan](docs/images/profile_office-scan.jpg) | ![Photocopy Xerox](docs/images/profile_photocopy-xerox.jpg) |
+
+| `book-gutter-bend` | Clean Sheet Music | `sheet-music` Degraded |
+| :---: | :---: | :---: |
+| ![Book Gutter Bend](docs/images/profile_book-gutter-bend.jpg) | ![Clean Sheet Music](docs/images/clean_sheet_music.jpg) | ![Sheet Music Degraded](docs/images/profile_sheet-music.jpg) |
 
 ---
 
@@ -90,6 +112,8 @@ Key CLI flags:
 | `--preset <NAME>` / `--reduced` | `full` | Pipeline fidelity preset (`full` vs `reduced`: skips fine grain, CA, sensor noise; coarsens ink & aging) |
 | `--skip-bend` | `false` | Skip non-linear page bend (enables exact projective/affine bounding-box reprojection) |
 | `--fast-banks` | `false` | Precomputed 256×256 tiled Gaussian banks + precomputed lighting field on CPU |
+| `--export-masks` | `false` | Export pixel-aligned ground-truth masks (`uv_flow`, `illumination`, `clean_ink`, `artifacts`) |
+| `--mask-format <FMT>` | `npy-png` | Floating-point mask format: `npy-png` (NumPy `.npy` v1.0 + PNG) or `png16` (16-bit RGB PNG) |
 | `--gpu` / `--cpu` | auto | Require WGPU (fail if unavailable) or force CPU; default auto-detects GPU with clean CPU fallback |
 
 ---
@@ -100,7 +124,7 @@ Add `doc-photo-degrade` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-doc-photo-degrade = "0.1"
+doc-photo-degrade = "0.2"
 image = "0.25"
 ```
 
@@ -123,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 For GPU-less or minimal-dependency builds, disable the default `gpu` feature:
 
 ```toml
-doc-photo-degrade = { version = "0.1", default-features = false }
+doc-photo-degrade = { version = "0.2", default-features = false }
 ```
 
 ---
@@ -227,7 +251,7 @@ If you use `doc-photo-degrade` in research or Document AI benchmarks, please cit
   title        = {doc-photo-degrade: Deterministic, Margin-Safe Rust + WGPU Document Photo Degradation Engine},
   author       = {Gregor Eesmaa and doc-photo-degrade contributors},
   year         = {2026},
-  version      = {0.1.0},
+  version      = {0.2.0},
   license      = {MIT OR Apache-2.0},
   url          = {https://github.com/gregoreesmaa/doc-photo-degrade}
 }

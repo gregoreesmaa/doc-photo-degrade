@@ -249,7 +249,9 @@ pub fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
     encode_jpeg_bytes(img.as_raw(), img.width(), img.height(), quality).map(|(b, _)| b)
 }
 
-/// Encode interleaved RGB -> JPEG bytes via SIMD `jpeg-encoder`.
+/// Encode interleaved RGB -> JPEG bytes via SIMD `jpeg-encoder` with true
+/// `4:2:0` chroma subsampling (`SamplingFactor::F_2_2`), matching smartphone
+/// camera JPEG encoders.
 /// Returns the bytes plus the codec tag (`"zune"`) recorded in params.
 pub(crate) fn encode_jpeg_bytes(
     rgb: &[u8],
@@ -260,8 +262,9 @@ pub(crate) fn encode_jpeg_bytes(
     let w16 = u16::try_from(w).map_err(|_| "width exceeds JPEG limit".to_string())?;
     let h16 = u16::try_from(h).map_err(|_| "height exceeds JPEG limit".to_string())?;
     let mut buf: Vec<u8> = Vec::new();
-    jpeg_encoder::Encoder::new(&mut buf, quality)
-        .encode(rgb, w16, h16, jpeg_encoder::ColorType::Rgb)
+    let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality);
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    enc.encode(rgb, w16, h16, jpeg_encoder::ColorType::Rgb)
         .map_err(|e| format!("jpeg encode: {e:?}"))?;
     Ok((buf, "zune"))
 }
@@ -372,5 +375,40 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"hello");
         assert!(!dir.join("out.txt.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jpeg_encoder_uses_420_chroma_subsampling() {
+        let img = RgbImage::from_pixel(32, 32, image::Rgb([180, 90, 45]));
+        let bytes = encode_jpeg(&img, 85).expect("encode_jpeg");
+        // Scan JPEG markers for SOF0 (0xFF, 0xC0) and verify 4:2:0 sampling:
+        // component 1 (Y) = 0x22 (2x2), component 2 (Cb) = 0x11, component 3 (Cr) = 0x11.
+        let mut i = 2usize; // skip SOI (0xFF 0xD8)
+        let mut found_sof0 = false;
+        while i + 4 < bytes.len() {
+            if bytes[i] != 0xFF {
+                break;
+            }
+            let marker = bytes[i + 1];
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if marker == 0xC0 {
+                // SOF0 payload: precision(1), height(2), width(2), n_comp(1), then [id, hv, qtable]*n_comp
+                let n_comp = bytes[i + 9];
+                assert_eq!(n_comp, 3, "expected 3 YCbCr components");
+                let y_hv = bytes[i + 11];
+                let cb_hv = bytes[i + 14];
+                let cr_hv = bytes[i + 17];
+                assert_eq!(y_hv, 0x22, "Y sampling must be 2x2 (4:2:0)");
+                assert_eq!(cb_hv, 0x11, "Cb sampling must be 1x1 (4:2:0)");
+                assert_eq!(cr_hv, 0x11, "Cr sampling must be 1x1 (4:2:0)");
+                found_sof0 = true;
+                break;
+            }
+            if marker == 0xDA || len < 2 {
+                break;
+            }
+            i += 2 + len;
+        }
+        assert!(found_sof0, "SOF0 marker not found in JPEG stream");
     }
 }

@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gregoreesmaa/doc-photo-degrade"
@@ -18,7 +18,7 @@ categories = ["multimedia::images", "computer-vision"]
 [workspace.dependencies]
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-doc-photo-degrade-gpu = { path = "crates/doc-photo-degrade-gpu", version = "0.1.0" }
+doc-photo-degrade-gpu = { path = "crates/doc-photo-degrade-gpu", version = "0.2.0" }
 fast_image_resize = "6.1.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 jpeg-encoder = { version = "0.7.1", features = ["simd"] }

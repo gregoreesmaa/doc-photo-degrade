@@ -1,34 +1,38 @@
 //! Ground-truth coordinate reprojection utilities built directly from
 //! [`DegradeParams`].
 //!
-//! Maps points, axis-aligned bounding boxes, and polygons from the pre-degrade
-//! working-image coordinate space (after `max_width` / `train_width` pre-scaling)
-//! into the final degraded output image space through the projective / affine
+//! Maps points, axis-aligned bounding boxes, and polygons between the
+//! pre-degrade working-image coordinate space (after `max_width` / `train_width`
+//! pre-scaling) and the final degraded output image space through the full
 //! geometric pipeline:
-//! 1. Perspective homography (`corner_offsets`)
-//! 2. Photo framing (`frame_mode`: `"inset"` pad or `"tight"` cut)
-//! 3. Canvas-expanding page rotation (`rotation_deg`)
-//! 4. Output capture downscale (`scale_x`, `scale_y`)
+//! 1. Non-linear page bend (`curl_side`: `"left"`, `"right"`, `"top"`,
+//!    `"bottom"`, `"spine"`, `"ripple"`)
+//! 2. Perspective homography (`corner_offsets`)
+//! 3. Photo framing (`frame_mode`: `"inset"` pad or `"tight"` cut)
+//! 4. Canvas-expanding page rotation (`rotation_deg`)
+//! 5. Output capture downscale (`params.width / w_rot`, `params.height / h_rot`
+//!    with pixel-center convention on CPU, or `scale_x`/`scale_y` on fused GPU)
 //!
-//! # Exactness Scope
+//! # Exact vs Linear Functions
 //!
-//! [`transform_point_linear`], [`transform_bbox`], and [`transform_polygon`]
-//! model the projective + framing + rotation + downscale stages and are
-//! **exact when non-linear page bend is disabled** (for example with
-//! [`crate::DocumentProfile::OfficeScan`], [`crate::DocumentProfile::PhotocopyXerox`],
-//! `StageToggles { skip_bend: true, .. }`, or the CLI `--skip-bend` flag). When
-//! page bend is enabled, these functions provide a linear/projective
-//! approximation that does not include the local curl/spine/ripple displacement.
+//! - [`transform_point_exact`], [`unproject_point_exact`],
+//!   [`transform_bbox_exact`], and [`transform_polygon_exact`] model **all 5
+//!   stages** including exact non-linear page bend inversion (`< 0.2 px`
+//!   end-to-end rendered accuracy, `< 1e-9 px` algebraic round-trip).
+//! - [`transform_point_linear`], [`transform_bbox`], and [`transform_polygon`]
+//!   model the projective + framing + rotation + downscale stages without
+//!   non-linear page bend (exact when `--skip-bend` / `OfficeScan` /
+//!   `PhotocopyXerox` is used).
 
-use crate::geometry::{apply_h, framed_dims, solve_homography};
+use crate::geometry::{apply_h, framed_dims, invert_3x3, solve_homography};
 use crate::DegradeParams;
 
-/// Derive the working-image `(width, height)` prior to perspective/framing.
+/// Derive the working-image `(width, height)` prior to bend/perspective/framing.
 ///
 /// Mirrors the pre-degrade sizing logic in `lib.rs` (`src_width`/`src_height`
 /// rescaled to `train_width` when active), falling back to `(params.width,
 /// params.height)` if `src_width`/`src_height` are unset.
-fn working_dims(params: &DegradeParams) -> (u32, u32) {
+pub(crate) fn working_dims(params: &DegradeParams) -> (u32, u32) {
     if params.src_width == 0 || params.src_height == 0 {
         return (params.width, params.height);
     }
@@ -39,6 +43,501 @@ fn working_dims(params: &DegradeParams) -> (u32, u32) {
     } else {
         (params.src_width, params.src_height)
     }
+}
+
+/// Exact `f64` backward page-bend map: given a destination coordinate `(xb, yb)`
+/// in bent-image space, returns the source coordinate `(xs, ys)` sampled by
+/// Stage 2 in `lib.rs`.
+pub fn bend_backward(xb: f64, yb: f64, w0: u32, h0: u32, params: &DegradeParams) -> (f64, f64) {
+    if params.curl_px <= 0.25 || w0 == 0 || h0 == 0 {
+        return (xb, yb);
+    }
+    let wf = w0 as f64;
+    let hf = h0 as f64;
+    let curl_px = params.curl_px as f64;
+
+    match params.curl_side.as_str() {
+        "spine" => {
+            let depth = ((curl_px / wf) * 2.0).min(0.15);
+            let spine_cx = params.bend_spine_cx as f64;
+            let spine_w = (params.bend_spine_w as f64).max(1.0);
+            let t = (xb - spine_cx) / spine_w;
+            let g = (-t * t).exp();
+            let xs = spine_cx + (xb - spine_cx) * (1.0 - depth * g);
+            (xs, yb)
+        }
+        "ripple" => {
+            let fx = params.bend_ripple_fx as f64;
+            let fy = params.bend_ripple_fy as f64;
+            let ph = params.bend_ripple_ph as f64;
+            let ox = curl_px * 0.5 * (std::f64::consts::TAU * fx * yb / hf + ph).sin();
+            let oy = curl_px * 0.3 * (std::f64::consts::TAU * fy * xb / wf + ph).cos();
+            (xb + ox, yb + oy)
+        }
+        "right" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * yb / hf).sin();
+            let edge = xb / wf;
+            let shift = curl_px * edge * edge * wave;
+            (xb - shift, yb)
+        }
+        "top" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * xb / wf).sin();
+            let edge = 1.0 - yb / hf;
+            let shift = curl_px * edge * edge * wave;
+            (xb, yb + shift)
+        }
+        "bottom" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * xb / wf).sin();
+            let edge = yb / hf;
+            let shift = curl_px * edge * edge * wave;
+            (xb, yb - shift)
+        }
+        _ => {
+            // "left" (default edge curl)
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * yb / hf).sin();
+            let edge = 1.0 - xb / wf;
+            let shift = curl_px * edge * edge * wave;
+            (xb + shift, yb)
+        }
+    }
+}
+
+/// Exact `f64` forward page-bend map: given a source coordinate `(xs, ys)` in
+/// working-image space, returns `(xb, yb)` in bent-image space such that
+/// `bend_backward(xb, yb, w0, h0, params) == (xs, ys)`.
+///
+/// - `"left"`, `"right"`, `"top"`, `"bottom"`: exact closed-form Citardauq
+///   quadratic solution.
+/// - `"spine"`: 1D Newton-Raphson (slope >= 0.85 everywhere, <= 8 iters,
+///   `< 1e-11 px`).
+/// - `"ripple"`: 2D Newton-Raphson with analytic 2x2 Jacobian (<= 12 iters,
+///   `< 1e-10 px`).
+pub fn bend_forward_exact(
+    xs: f64,
+    ys: f64,
+    w0: u32,
+    h0: u32,
+    params: &DegradeParams,
+) -> (f64, f64) {
+    if params.curl_px <= 0.25 || w0 == 0 || h0 == 0 {
+        return (xs, ys);
+    }
+    let wf = w0 as f64;
+    let hf = h0 as f64;
+    let curl_px = params.curl_px as f64;
+
+    match params.curl_side.as_str() {
+        "spine" => {
+            let depth = ((curl_px / wf) * 2.0).min(0.15);
+            let spine_cx = params.bend_spine_cx as f64;
+            let spine_w = (params.bend_spine_w as f64).max(1.0);
+            let u_s = (xs - spine_cx) / spine_w;
+            let mut u = u_s;
+            for _ in 0..8 {
+                let e = (-u * u).exp();
+                let f = u * (1.0 - depth * e) - u_s;
+                if (f * spine_w).abs() < 1e-11 {
+                    break;
+                }
+                let df = 1.0 - depth * e * (1.0 - 2.0 * u * u);
+                u -= f / df;
+            }
+            (spine_cx + u * spine_w, ys)
+        }
+        "ripple" => {
+            let fx = params.bend_ripple_fx as f64;
+            let fy = params.bend_ripple_fy as f64;
+            let ph = params.bend_ripple_ph as f64;
+            let ax = 0.5 * curl_px;
+            let ay = 0.3 * curl_px;
+            let kx = std::f64::consts::TAU * fx / hf;
+            let ky = std::f64::consts::TAU * fy / wf;
+            let mut xb = xs;
+            let mut yb = ys;
+            for _ in 0..12 {
+                let ang_x = kx * yb + ph;
+                let ang_y = ky * xb + ph;
+                let f0 = xb + ax * ang_x.sin() - xs;
+                let f1 = yb + ay * ang_y.cos() - ys;
+                if f0.abs().max(f1.abs()) < 1e-10 {
+                    break;
+                }
+                let j01 = ax * kx * ang_x.cos();
+                let j10 = -ay * ky * ang_y.sin();
+                let det = 1.0 - j01 * j10;
+                if det.abs() < 1e-12 {
+                    break;
+                }
+                xb -= (f0 - j01 * f1) / det;
+                yb -= (-j10 * f0 + f1) / det;
+            }
+            (xb, yb)
+        }
+        "right" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * ys / hf).sin();
+            let c = curl_px * wave;
+            let c_rhs = xs;
+            let disc = (wf * wf - 4.0 * c * c_rhs).max(0.0).sqrt();
+            let e = 2.0 * c_rhs / (wf + disc);
+            (wf * e, ys)
+        }
+        "top" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * xs / wf).sin();
+            let c = curl_px * wave;
+            let c_rhs = hf - ys;
+            let disc = (hf * hf - 4.0 * c * c_rhs).max(0.0).sqrt();
+            let e = 2.0 * c_rhs / (hf + disc);
+            (xs, hf * (1.0 - e))
+        }
+        "bottom" => {
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * xs / wf).sin();
+            let c = curl_px * wave;
+            let c_rhs = ys;
+            let disc = (hf * hf - 4.0 * c * c_rhs).max(0.0).sqrt();
+            let e = 2.0 * c_rhs / (hf + disc);
+            (xs, hf * e)
+        }
+        _ => {
+            // "left"
+            let wave = 0.6 + 0.4 * (std::f64::consts::PI * ys / hf).sin();
+            let c = curl_px * wave;
+            let c_rhs = wf - xs;
+            let disc = (wf * wf - 4.0 * c * c_rhs).max(0.0).sqrt();
+            let e = 2.0 * c_rhs / (wf + disc);
+            (wf * (1.0 - e), ys)
+        }
+    }
+}
+
+/// Precomputed geometric transform context for fast per-pixel forward/backward
+/// exact reprojection (hoists homography solve/invert and rotation trig).
+pub(crate) struct ReprojectContext<'a> {
+    pub(crate) params: &'a DegradeParams,
+    pub(crate) w0: u32,
+    pub(crate) h0: u32,
+    pub(crate) fw: u32,
+    pub(crate) fh: u32,
+    pub(crate) w_rot: u32,
+    pub(crate) h_rot: u32,
+    pub(crate) rot_active: bool,
+    pub(crate) snt: f64,
+    pub(crate) cst: f64,
+    pub(crate) h_fwd: Option<[f64; 9]>,
+    pub(crate) h_inv: Option<[f64; 9]>,
+}
+
+impl<'a> ReprojectContext<'a> {
+    pub(crate) fn new(params: &'a DegradeParams) -> Self {
+        let (w0, h0) = working_dims(params);
+        let has_persp = params
+            .corner_offsets
+            .iter()
+            .any(|o| o[0].abs() > 1e-9 || o[1].abs() > 1e-9);
+        let (h_fwd, h_inv) = if has_persp && w0 > 0 && h0 > 0 {
+            let wf = w0 as f64;
+            let hf = h0 as f64;
+            let src_c = [(0.0, 0.0), (wf, 0.0), (wf, hf), (0.0, hf)];
+            let mut dst_c = [(0.0f64, 0.0f64); 4];
+            for i in 0..4 {
+                dst_c[i] = (
+                    src_c[i].0 + params.corner_offsets[i][0] as f64,
+                    src_c[i].1 + params.corner_offsets[i][1] as f64,
+                );
+            }
+            let fwd = solve_homography(src_c, dst_c);
+            let inv = fwd.and_then(invert_3x3);
+            (fwd, inv)
+        } else {
+            (None, None)
+        };
+
+        let (fw, fh) = framed_dims(
+            w0,
+            h0,
+            &params.frame_mode,
+            params.frame_pad_px,
+            params.frame_cut_px,
+        );
+        let rot_active = params.rotation_deg.abs() > 0.05 && w0 > 4 && h0 > 4;
+        let (w_rot, h_rot, snt, cst) = if rot_active {
+            // Compute integer canvas dims with the exact f32 formula from lib.rs.
+            let th32 = params.rotation_deg.to_radians();
+            let (sn32, cs32) = (th32.sin().abs(), th32.cos().abs());
+            let w2 = ((fw as f32) * cs32 + (fh as f32) * sn32).ceil().max(1.0) as u32;
+            let h2 = ((fw as f32) * sn32 + (fh as f32) * cs32).ceil().max(1.0) as u32;
+            let th = (params.rotation_deg as f64).to_radians();
+            (w2, h2, th.sin(), th.cos())
+        } else {
+            (fw, fh, 0.0, 1.0)
+        };
+
+        Self {
+            params,
+            w0,
+            h0,
+            fw,
+            fh,
+            w_rot,
+            h_rot,
+            rot_active,
+            snt,
+            cst,
+            h_fwd,
+            h_inv,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn forward(&self, x: f64, y: f64) -> (f64, f64) {
+        // 1. Exact non-linear page bend (src -> bent).
+        let (mut px, mut py) = bend_forward_exact(x, y, self.w0, self.h0, self.params);
+
+        // 2. Perspective homography (bent -> persp).
+        if let Some(ref h_fwd) = self.h_fwd {
+            (px, py) = apply_h(h_fwd, px, py);
+        }
+
+        // 3. Photo framing: inset pad or tight crop.
+        if self.params.frame_mode == "inset" {
+            px += self.params.frame_pad_px[0] as f64;
+            py += self.params.frame_pad_px[1] as f64;
+        } else {
+            px -= self.params.frame_cut_px[0] as f64;
+            py -= self.params.frame_cut_px[1] as f64;
+        }
+
+        // 4. Canvas-expanding page rotation.
+        if self.rot_active {
+            let (cx0, cy0) = (self.fw as f64 / 2.0, self.fh as f64 / 2.0);
+            let (cx1, cy1) = (self.w_rot as f64 / 2.0, self.h_rot as f64 / 2.0);
+            let u = px - cx0;
+            let v = py - cy0;
+            px = cx1 + u * self.cst - v * self.snt;
+            py = cy1 + u * self.snt + v * self.cst;
+        }
+
+        // 5. Output capture downscale.
+        if self.params.rot_scale_fused {
+            let sx = if self.params.scale_x > 0.0 {
+                self.params.scale_x as f64
+            } else {
+                1.0
+            };
+            let sy = if self.params.scale_y > 0.0 {
+                self.params.scale_y as f64
+            } else {
+                1.0
+            };
+            (px * sx, py * sy)
+        } else if self.params.width > 0
+            && self.params.height > 0
+            && (self.params.width != self.w_rot || self.params.height != self.h_rot)
+        {
+            let rx = self.params.width as f64 / self.w_rot as f64;
+            let ry = self.params.height as f64 / self.h_rot as f64;
+            ((px + 0.5) * rx - 0.5, (py + 0.5) * ry - 0.5)
+        } else {
+            (px, py)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn undo_downscale(&self, x_out: f64, y_out: f64) -> (f64, f64) {
+        if self.params.rot_scale_fused {
+            let sx = if self.params.scale_x > 0.0 {
+                self.params.scale_x as f64
+            } else {
+                1.0
+            };
+            let sy = if self.params.scale_y > 0.0 {
+                self.params.scale_y as f64
+            } else {
+                1.0
+            };
+            (x_out / sx, y_out / sy)
+        } else if self.params.width > 0
+            && self.params.height > 0
+            && (self.params.width != self.w_rot || self.params.height != self.h_rot)
+        {
+            let inv_rx = self.w_rot as f64 / self.params.width as f64;
+            let inv_ry = self.h_rot as f64 / self.params.height as f64;
+            ((x_out + 0.5) * inv_rx - 0.5, (y_out + 0.5) * inv_ry - 0.5)
+        } else {
+            (x_out, y_out)
+        }
+    }
+
+    /// Map an output pixel `(x_out, y_out)` back to the coordinate space where
+    /// Stage 5 lighting ran: `(w_rot, h_rot)` on CPU, or `(fw, fh)` on fused GPU.
+    #[inline]
+    pub(crate) fn to_lighting_coords(&self, x_out: f64, y_out: f64) -> (f64, f64) {
+        let (xr, yr) = self.undo_downscale(x_out, y_out);
+        if self.params.rot_scale_fused && self.rot_active {
+            let (cx0, cy0) = (self.fw as f64 / 2.0, self.fh as f64 / 2.0);
+            let (cx1, cy1) = (self.w_rot as f64 / 2.0, self.h_rot as f64 / 2.0);
+            let dx = xr - cx1;
+            let dy = yr - cy1;
+            (
+                cx0 + dx * self.cst + dy * self.snt,
+                cy0 - dx * self.snt + dy * self.cst,
+            )
+        } else {
+            (xr, yr)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn lighting_dims(&self) -> (u32, u32) {
+        if self.params.rot_scale_fused {
+            (self.fw, self.fh)
+        } else {
+            (self.w_rot, self.h_rot)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unproject(&self, x_out: f64, y_out: f64) -> Option<(f64, f64)> {
+        const EPS: f64 = 1e-6;
+        // 1. Undo downscale -> (x_rot, y_rot).
+        let (x_rot, y_rot) = self.undo_downscale(x_out, y_out);
+
+        // 2. Undo rotation -> (x_frame, y_frame).
+        let (x_frame, y_frame) = if self.rot_active {
+            let (cx0, cy0) = (self.fw as f64 / 2.0, self.fh as f64 / 2.0);
+            let (cx1, cy1) = (self.w_rot as f64 / 2.0, self.h_rot as f64 / 2.0);
+            let dx = x_rot - cx1;
+            let dy = y_rot - cy1;
+            let fx = cx0 + dx * self.cst + dy * self.snt;
+            let fy = cy0 - dx * self.snt + dy * self.cst;
+            if fx < -EPS || fy < -EPS || fx > self.fw as f64 + EPS || fy > self.fh as f64 + EPS {
+                return None;
+            }
+            (fx, fy)
+        } else {
+            (x_rot, y_rot)
+        };
+
+        // 3. Undo framing -> (x_persp, y_persp).
+        let (x_persp, y_persp) = if self.params.frame_mode == "inset" {
+            let px = x_frame - self.params.frame_pad_px[0] as f64;
+            let py = y_frame - self.params.frame_pad_px[1] as f64;
+            if px < -EPS || py < -EPS || px > self.w0 as f64 + EPS || py > self.h0 as f64 + EPS {
+                return None;
+            }
+            (px, py)
+        } else {
+            (
+                x_frame + self.params.frame_cut_px[0] as f64,
+                y_frame + self.params.frame_cut_px[1] as f64,
+            )
+        };
+
+        // 4. Undo perspective -> (x_bend, y_bend).
+        let (x_bend, y_bend) = if let Some(ref h_inv) = self.h_inv {
+            let (bx, by) = apply_h(h_inv, x_persp, y_persp);
+            if bx < -EPS || by < -EPS || bx > self.w0 as f64 + EPS || by > self.h0 as f64 + EPS {
+                return None;
+            }
+            (bx, by)
+        } else {
+            (x_persp, y_persp)
+        };
+
+        // 5. Undo non-linear page bend -> (x_src, y_src).
+        let (x_src, y_src) = bend_backward(x_bend, y_bend, self.w0, self.h0, self.params);
+        if x_src < -EPS
+            || y_src < -EPS
+            || x_src > self.w0 as f64 + EPS
+            || y_src > self.h0 as f64 + EPS
+        {
+            return None;
+        }
+        Some((x_src, y_src))
+    }
+}
+
+/// Forward-project a point `(x, y)` from working-image space through the full
+/// geometric pipeline: non-linear page bend → perspective homography → framing
+/// → rotation → exact output downscale.
+pub fn transform_point_exact(x: f64, y: f64, params: &DegradeParams) -> (f64, f64) {
+    ReprojectContext::new(params).forward(x, y)
+}
+
+/// Backward-project a point `(x_out, y_out)` from the final degraded image
+/// space back to working-image coordinates `(x_src, y_src)`.
+///
+/// Returns `None` if the output pixel lies outside the original document page
+/// (e.g. rotated desk corners, inset desk padding, or perspective bleed).
+pub fn unproject_point_exact(x_out: f64, y_out: f64, params: &DegradeParams) -> Option<(f64, f64)> {
+    ReprojectContext::new(params).unproject(x_out, y_out)
+}
+
+/// Forward-project an axis-aligned bounding box `[x0, y0, x1, y1]` through
+/// [`transform_point_exact`] by sampling `samples_per_edge` segments along each
+/// of the 4 perimeter edges, returning the tight AABB `[min_x, min_y, max_x, max_y]`.
+pub fn transform_bbox_exact(
+    bbox: [f64; 4],
+    params: &DegradeParams,
+    samples_per_edge: usize,
+) -> [f64; 4] {
+    let ctx = ReprojectContext::new(params);
+    let [x0, y0, x1, y1] = bbox;
+    let n = samples_per_edge.max(1);
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    let mut visit = |sx: f64, sy: f64| {
+        let (tx, ty) = ctx.forward(sx, sy);
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    };
+
+    for i in 0..=n {
+        let t = i as f64 / n as f64;
+        visit(x0 + (x1 - x0) * t, y0);
+        visit(x0 + (x1 - x0) * t, y1);
+        visit(x0, y0 + (y1 - y0) * t);
+        visit(x1, y0 + (y1 - y0) * t);
+    }
+
+    [min_x, min_y, max_x, max_y]
+}
+
+/// Forward-project a closed polygon through [`transform_point_exact`],
+/// subdividing edges longer than `max_segment_px` (in source working-image
+/// pixels) so curved page-bend edges are faithfully captured.
+pub fn transform_polygon_exact(
+    poly: &[(f64, f64)],
+    params: &DegradeParams,
+    max_segment_px: f64,
+) -> Vec<(f64, f64)> {
+    if poly.is_empty() {
+        return Vec::new();
+    }
+    let ctx = ReprojectContext::new(params);
+    if poly.len() == 1 {
+        return vec![ctx.forward(poly[0].0, poly[0].1)];
+    }
+    let mut out = Vec::with_capacity(poly.len());
+    for i in 0..poly.len() {
+        let (x0, y0) = poly[i];
+        let (x1, y1) = poly[(i + 1) % poly.len()];
+        let len = (x1 - x0).hypot(y1 - y0);
+        let steps = if max_segment_px > 0.0 {
+            (len / max_segment_px).ceil().max(1.0) as usize
+        } else {
+            1
+        };
+        for k in 0..steps {
+            let t = k as f64 / steps as f64;
+            out.push(ctx.forward(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t));
+        }
+    }
+    out
 }
 
 /// Forward-project a point `(x, y)` from working-image space through the linear
@@ -304,6 +803,11 @@ mod tests {
             noise_sigma: 0.0,
             jpeg_quality: 100,
             codec: "zune".to_string(),
+            awb_warm_cool_strength: 0.0,
+            usm_strength: 0.0,
+            desk_surface: "none".to_string(),
+            crumple_strength: 0.0,
+            sheen_strength: 0.0,
         }
     }
 
@@ -460,6 +964,214 @@ mod tests {
         assert!(
             found_w as f64 >= crop_w as f64 * 0.70 && found_h as f64 >= crop_h as f64 * 0.70,
             "ink span ({found_w}x{found_h}) should fill >=70% of reprojected box ({crop_w}x{crop_h})"
+        );
+    }
+
+    #[test]
+    fn exact_round_trip_all_six_bend_modes() {
+        let (w0, h0) = (400u32, 300u32);
+        let modes = ["left", "right", "top", "bottom", "spine", "ripple"];
+        for (mi, &mode) in modes.iter().enumerate() {
+            let mut p = identity_params(w0, h0);
+            p.strength = 1.0;
+            p.curl_side = mode.to_string();
+            p.curl_px = w0 as f32 * 0.08;
+            p.curl_shade = 0.35;
+            p.bend_spine_cx = w0 as f32 * 0.48;
+            p.bend_spine_w = w0 as f32 * 0.05;
+            p.bend_ripple_fx = 2.2;
+            p.bend_ripple_fy = 1.8;
+            p.bend_ripple_ph = 1.1;
+            p.corner_offsets = [[14.0, 9.0], [-12.0, 11.0], [-10.0, -13.0], [15.0, -8.0]];
+            if mi % 2 == 0 {
+                p.frame_mode = "inset".to_string();
+                p.frame_pad_px = [12, 10, 14, 11];
+            } else {
+                p.frame_mode = "tight".to_string();
+                p.frame_cut_px = [6, 5, 7, 4];
+            }
+            p.rotation_deg = -7.5;
+            let (fw, fh) = framed_dims(w0, h0, &p.frame_mode, p.frame_pad_px, p.frame_cut_px);
+            let th = p.rotation_deg.to_radians();
+            let w_rot = ((fw as f32) * th.cos().abs() + (fh as f32) * th.sin().abs())
+                .ceil()
+                .max(1.0) as u32;
+            let h_rot = ((fw as f32) * th.sin().abs() + (fh as f32) * th.cos().abs())
+                .ceil()
+                .max(1.0) as u32;
+            p.scale_x = 0.67;
+            p.scale_y = 0.64;
+            p.width = ((w_rot as f32 * p.scale_x) as u32).max(1);
+            p.height = ((h_rot as f32 * p.scale_y) as u32).max(1);
+
+            let mut max_err = 0.0f64;
+            for gy in 1..=7 {
+                for gx in 1..=7 {
+                    let x = 35.0 + (w0 as f64 - 70.0) * (gx as f64 / 8.0);
+                    let y = 30.0 + (h0 as f64 - 60.0) * (gy as f64 / 8.0);
+                    let (ox, oy) = transform_point_exact(x, y, &p);
+                    let (rx, ry) = unproject_point_exact(ox, oy, &p).unwrap_or_else(|| {
+                        panic!("mode={mode} point ({x},{y}) -> ({ox},{oy}) unprojected to None")
+                    });
+                    let err = (rx - x).hypot(ry - y);
+                    max_err = max_err.max(err);
+                }
+            }
+            assert!(
+                max_err < 1e-9,
+                "mode={mode}: round-trip error {max_err:.3e} px exceeds 1e-9"
+            );
+
+            // Also verify transform_bbox_exact and transform_polygon_exact run cleanly.
+            let bb = transform_bbox_exact([50.0, 40.0, 350.0, 260.0], &p, 16);
+            assert!(bb[2] > bb[0] && bb[3] > bb[1]);
+            let poly = [(50.0, 40.0), (350.0, 40.0), (350.0, 260.0), (50.0, 260.0)];
+            let tpoly = transform_polygon_exact(&poly, &p, 50.0);
+            assert!(tpoly.len() > poly.len());
+        }
+    }
+
+    #[test]
+    fn rendered_ink_centroid_error_under_quarter_pixel() {
+        use crate::{degrade_image, DegradeConfig, StageToggles};
+        use image::{Rgb, RgbImage};
+
+        let (w, h) = (480u32, 360u32);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+        // Place a 3x3 grid of compact symmetric 5x5 black dots (dx^2+dy^2 <= 5)
+        // in the interior so non-linear bend curvature (Jensen's inequality)
+        // doesn't shift the dot's centroid away from its geometric center.
+        let centers: Vec<(u32, u32)> = [120u32, 240, 360]
+            .into_iter()
+            .flat_map(|cx| [90u32, 180, 270].into_iter().map(move |cy| (cx, cy)))
+            .collect();
+        for &(cx, cy) in &centers {
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    if dx * dx + dy * dy <= 5 {
+                        img.put_pixel(
+                            (cx as i32 + dx) as u32,
+                            (cy as i32 + dy) as u32,
+                            Rgb([0, 0, 0]),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut seen_spine = false;
+        let mut seen_ripple = false;
+        let mut seen_edge = false;
+        let mut global_max_err = 0.0f64;
+
+        for seed in 0..40u64 {
+            if seen_spine && seen_ripple && seen_edge {
+                break;
+            }
+            let mut cfg = DegradeConfig::default().with_seed(seed).with_strength(0.55);
+            cfg.scale_min = 0.65;
+            cfg.jpeg_quality = Some(100);
+            cfg.toggles = StageToggles::reduced();
+            let res = degrade_image(img.clone(), &cfg).expect("degrade_image must succeed");
+            let p = &res.params;
+
+            let is_spine = p.curl_side == "spine";
+            let is_ripple = p.curl_side == "ripple";
+            let is_edge = !is_spine && !is_ripple;
+            if (is_spine && seen_spine) || (is_ripple && seen_ripple) || (is_edge && seen_edge) {
+                continue;
+            }
+
+            let mut errs = Vec::new();
+            for &(cx, cy) in &centers {
+                let (px, py) = transform_point_exact(cx as f64, cy as f64, p);
+                let ix = px.round() as i32;
+                let iy = py.round() as i32;
+                let rad = 6i32;
+                if ix - rad < 2
+                    || iy - rad < 2
+                    || ix + rad >= p.width as i32 - 2
+                    || iy + rad >= p.height as i32 - 2
+                {
+                    continue;
+                }
+                // Measure local background luma around the perimeter of the window.
+                let mut bg_sum = 0.0f64;
+                let mut bg_n = 0usize;
+                for dy in -rad..=rad {
+                    for dx in -rad..=rad {
+                        if dx.abs() == rad || dy.abs() == rad {
+                            let rgb = res.image.get_pixel((ix + dx) as u32, (iy + dy) as u32).0;
+                            bg_sum += (rgb[0] as f64 + rgb[1] as f64 + rgb[2] as f64) / 3.0;
+                            bg_n += 1;
+                        }
+                    }
+                }
+                let bg = bg_sum / bg_n as f64;
+                if bg < 160.0 {
+                    // Occluded by a dark artifact (e.g. sticky note/stain/fold).
+                    continue;
+                }
+                // Use a tight core-ink threshold so faint wear/misregistration
+                // halos (-18 luma) don't bias the geometric centroid.
+                let thresh = bg * 0.50;
+                let (mut wx, mut wy, mut wsum) = (0.0f64, 0.0f64, 0.0f64);
+                let mut dark_count = 0usize;
+                for dy in -(rad - 1)..=(rad - 1) {
+                    for dx in -(rad - 1)..=(rad - 1) {
+                        let gx = ix + dx;
+                        let gy = iy + dy;
+                        let rgb = res.image.get_pixel(gx as u32, gy as u32).0;
+                        let luma = (rgb[0] as f64 + rgb[1] as f64 + rgb[2] as f64) / 3.0;
+                        if luma < thresh {
+                            let weight = (thresh - luma).max(0.0);
+                            wx += gx as f64 * weight;
+                            wy += gy as f64 * weight;
+                            wsum += weight;
+                            dark_count += 1;
+                        }
+                    }
+                }
+                if !(3..=60).contains(&dark_count) || wsum <= 0.0 {
+                    continue;
+                }
+                let (mx, my) = (wx / wsum, wy / wsum);
+                let err = (mx - px).hypot(my - py);
+                errs.push(err);
+            }
+            if errs.len() >= 5 {
+                errs.sort_by(|a, b| a.total_cmp(b));
+                let median_err = errs[errs.len() / 2];
+                // Trim at most 1 outlier dot that may be partially hit by a random
+                // ink-dropout cluster, eraser smudge, or specular sheen edge.
+                let trimmed_max = errs[errs.len() - 2];
+                assert!(
+                    median_err < 0.20,
+                    "seed={seed} mode={} median centroid err={median_err:.4} px >= 0.20 px",
+                    p.curl_side
+                );
+                assert!(
+                    trimmed_max < 0.25,
+                    "seed={seed} mode={} trimmed max centroid err={trimmed_max:.4} px >= 0.25 px",
+                    p.curl_side
+                );
+                global_max_err = global_max_err.max(trimmed_max);
+                if is_spine {
+                    seen_spine = true;
+                } else if is_ripple {
+                    seen_ripple = true;
+                } else {
+                    seen_edge = true;
+                }
+            }
+        }
+        assert!(
+            seen_spine && seen_ripple && seen_edge,
+            "expected to verify all 3 bend families (spine={seen_spine}, ripple={seen_ripple}, edge={seen_edge})"
+        );
+        assert!(
+            global_max_err < 0.25,
+            "global max centroid err={global_max_err:.4} px >= 0.25 px"
         );
     }
 }

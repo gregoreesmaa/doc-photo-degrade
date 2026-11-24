@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "doc-photo-degrade"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "doc-photo-degrade-gpu",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "doc-photo-degrade-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "pollster",

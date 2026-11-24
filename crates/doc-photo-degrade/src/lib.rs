@@ -49,7 +49,9 @@ pub mod geometry;
 #[cfg(feature = "gpu")]
 pub mod gpu_backend;
 pub mod ink;
+pub mod masks;
 pub mod paper;
+pub mod realism;
 pub mod reproject;
 pub mod wear;
 
@@ -60,8 +62,13 @@ pub use geometry::{content_bbox, content_bbox_thresh, margin_safe_crop, quiet_ma
 #[cfg(feature = "gpu")]
 pub use gpu_backend::Gpu;
 pub use ink::InkParams;
+pub use masks::{artifact_bits, DegradeMasks, MaskFormat, MaskRequest};
 pub use paper::PaperParams;
-pub use reproject::{transform_bbox, transform_point_linear, transform_polygon};
+pub use realism::RealismConfig;
+pub use reproject::{
+    bend_backward, bend_forward_exact, transform_bbox, transform_bbox_exact, transform_point_exact,
+    transform_point_linear, transform_polygon, transform_polygon_exact, unproject_point_exact,
+};
 pub use wear::WearParams;
 
 pub(crate) use geometry::sample_bilinear;
@@ -204,6 +211,11 @@ pub struct DegradeConfig {
     pub scale_min: f32,
     /// Per-stage skip/coarsen toggles and fast-bank switch.
     pub toggles: StageToggles,
+    /// Wave 2 photorealism toggles (calibrated per [`DocumentProfile`]).
+    pub realism: RealismConfig,
+    /// Optional multi-task ground-truth mask export (default: [`MaskRequest::none()`],
+    /// zero overhead when disabled).
+    pub masks: MaskRequest,
 }
 
 impl Default for DegradeConfig {
@@ -216,6 +228,8 @@ impl Default for DegradeConfig {
             train_width: 0,
             scale_min: 0.5,
             toggles: StageToggles::default(),
+            realism: RealismConfig::default(),
+            masks: MaskRequest::none(),
         }
     }
 }
@@ -256,12 +270,14 @@ impl DegradeConfig {
     }
 }
 
-/// Output of degrading a single document image: degraded pixels + full
-/// parameter provenance.
+/// Output of degrading a single document image: degraded pixels, full
+/// parameter provenance, and optional ground-truth supervision masks.
 #[derive(Debug, Clone)]
 pub struct DegradeResult {
     pub image: RgbImage,
     pub params: DegradeParams,
+    /// Ground-truth supervision masks when `cfg.masks.any()` is true; `None` by default.
+    pub masks: Option<DegradeMasks>,
 }
 
 /// Every sampled degradation parameter, written alongside degraded images as a
@@ -361,6 +377,22 @@ pub struct DegradeParams {
     pub jpeg_quality: u8,
     /// Pixel codec backend tag (e.g. `"zune"` or `"image"`).
     pub codec: String,
+    // Wave 2 photorealism parameters (backward-compatible via serde(default))
+    /// Mixed-illuminant warm-to-cool AWB gradient strength (`0.0` = off).
+    #[serde(default)]
+    pub awb_warm_cool_strength: f32,
+    /// Smartphone ISP unsharp-mask (USM) halo strength (`0.0` = off).
+    #[serde(default)]
+    pub usm_strength: f32,
+    /// Procedural desk surface texture (`"none"`, `"walnut"`, `"slate"`, `"cloth"`).
+    #[serde(default)]
+    pub desk_surface: String,
+    /// Multi-scale 3D paper crumpling normal shading strength (`0.0` = off).
+    #[serde(default)]
+    pub crumple_strength: f32,
+    /// Plastic sheet-protector diagonal specular sheen strength (`0.0` = off).
+    #[serde(default)]
+    pub sheen_strength: f32,
 }
 
 /// Degrade an in-memory `RgbImage` on the CPU backend.
@@ -486,6 +518,17 @@ fn degrade_image_inner(
         .pixels()
         .flat_map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
         .collect();
+
+    // Optional pre-degrade clean luma snapshot for `clean_ink` mask (zero alloc when off).
+    let clean_luma: Option<Vec<f32>> = if cfg.masks.clean_ink {
+        Some(
+            img.pixels()
+                .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     tick!("load+maxwidth");
 
@@ -997,6 +1040,13 @@ fn degrade_image_inner(
 
     tick!("rotation");
 
+    // --- 3a2. coupled 3D paper crumpling normal shading (photometric only;
+    // runs after framing so content_bbox / quiet_margins are unaffected) ---
+    let crumple_strength =
+        realism::apply_crumple_shading(&mut buf, w, h, &mut rng, s, cfg.realism.enable_crumple);
+
+    tick!("crumple");
+
     // --- 3b. physical artifacts: tears, stains, pencil, folds, highlighter ---
     // Placement is ink-aware: damage goes where document content isn't, so
     // text/symbols remain legible (highlighter is translucent by nature).
@@ -1007,6 +1057,13 @@ fn degrade_image_inner(
     let mut pencil_count = 0u32;
     let mut fold_corner = String::from("none");
     let mut highlight = String::from("none");
+    let art_w = w;
+    let art_h = h;
+    let mut art_mask: Option<Vec<u16>> = if cfg.masks.artifacts {
+        Some(vec![0u16; (w as usize) * (h as usize)])
+    } else {
+        None
+    };
 
     // Paper tears: jagged edge notches carved only from quiet margins.
     let n_tears = if rng.gen::<f32>() < s * 0.5 {
@@ -1035,6 +1092,26 @@ fn degrade_image_inner(
                 let depth = min_d * rng.gen_range(0.01..0.03);
                 let mask = banks::precompute_notch(along, mouth, depth);
                 banks::carve_notch_stamp(&mut buf, w, h, edge, &mask);
+                if let Some(ref mut am) = art_mask {
+                    let steps = mask.half_widths.len() as u32 - 1;
+                    for si in 0..=steps {
+                        let f = si as f32 / steps as f32;
+                        let hw = mask.half_widths[si as usize];
+                        let d = mask.depth * f;
+                        let (x0, x1) = ((mask.along - hw) as i64, (mask.along + hw) as i64);
+                        for v in x0..=x1 {
+                            let (px, py) = match edge {
+                                0 => (v, d as i64),
+                                2 => (v, (h as f32 - d) as i64),
+                                1 => ((w as f32 - d) as i64, v),
+                                _ => (d as i64, v),
+                            };
+                            if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                                am[(py as u32 * w + px as u32) as usize] |= artifact_bits::TEAR;
+                            }
+                        }
+                    }
+                }
                 tear_count += 1;
                 break;
             }
@@ -1051,6 +1128,14 @@ fn degrade_image_inner(
             const COFFEE: [f32; 3] = [122.0, 82.0, 42.0];
             let stamp = banks::precompute_coffee(r);
             banks::stamp_coffee(&mut buf, w, h, cx, cy, &stamp);
+            if let Some(ref mut am) = art_mask {
+                for &(dx, dy, _) in &stamp.cells {
+                    let (px, py) = (cx as i64 + dx as i64, cy as i64 + dy as i64);
+                    if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                        am[(py as u32 * w + px as u32) as usize] |= artifact_bits::STAIN;
+                    }
+                }
+            }
             for _ in 0..rng.gen_range(1..=3) {
                 let a = rng.gen_range(0.0..std::f32::consts::TAU);
                 let dist = r * rng.gen_range(1.2..2.2);
@@ -1060,7 +1145,14 @@ fn degrade_image_inner(
                 for dy in -pr..=pr {
                     for dx in -pr..=pr {
                         if dx * dx + dy * dy <= pr * pr {
-                            blend_px(&mut buf, w, h, px as i64 + dx, py as i64 + dy, COFFEE, 0.30);
+                            let (sx, sy) = (px as i64 + dx, py as i64 + dy);
+                            blend_px(&mut buf, w, h, sx, sy, COFFEE, 0.30);
+                            if let Some(ref mut am) = art_mask {
+                                if sx >= 0 && sy >= 0 && (sx as u32) < w && (sy as u32) < h {
+                                    am[(sy as u32 * w + sx as u32) as usize] |=
+                                        artifact_bits::STAIN;
+                                }
+                            }
                         }
                     }
                 }
@@ -1086,6 +1178,25 @@ fn degrade_image_inner(
                 let qx = px + len * ang.cos();
                 let qy = py + len * ang.sin();
                 stroke(&mut buf, w, h, px, py, qx, qy, 1, PENCIL);
+                if let Some(ref mut am) = art_mask {
+                    let steps = ((qx - px).abs().max((qy - py).abs()) as i64).max(1);
+                    for si in 0..=steps {
+                        let t = si as f32 / steps as f32;
+                        let cx = (px + (qx - px) * t) as i64;
+                        let cy = (py + (qy - py) * t) as i64;
+                        for dy in -1..=1i64 {
+                            for dx in -1..=1i64 {
+                                if dx * dx + dy * dy <= 1 {
+                                    let (sx, sy) = (cx + dx, cy + dy);
+                                    if sx >= 0 && sy >= 0 && (sx as u32) < w && (sy as u32) < h {
+                                        am[(sy as u32 * w + sx as u32) as usize] |=
+                                            artifact_bits::PENCIL;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 px = qx;
                 py = qy;
                 ang += rng.gen_range(-0.9..0.9);
@@ -1133,8 +1244,8 @@ fn degrade_image_inner(
                         let lx = if mx { leg - 1 - dx } else { dx };
                         let ly = if my { leg - 1 - dy } else { dy };
                         if lx + ly < leg {
-                            let i =
-                                (((y0 + dy) as usize) * (w as usize) + ((x0 + dx) as usize)) * 3;
+                            let pix = ((y0 + dy) as usize) * (w as usize) + ((x0 + dx) as usize);
+                            let i = pix * 3;
                             buf[i] *= 0.82;
                             buf[i + 1] *= 0.82;
                             buf[i + 2] *= 0.82;
@@ -1142,6 +1253,9 @@ fn degrade_image_inner(
                                 buf[i] = buf[i] * 0.55 + 255.0 * 0.45;
                                 buf[i + 1] = buf[i + 1] * 0.55 + 255.0 * 0.45;
                                 buf[i + 2] = buf[i + 2] * 0.55 + 255.0 * 0.45;
+                            }
+                            if let Some(ref mut am) = art_mask {
+                                am[pix] |= artifact_bits::FOLD_CREASE;
                             }
                         }
                     }
@@ -1163,9 +1277,13 @@ fn degrade_image_inner(
         let y0 = (h as f32 * rng.gen_range(0.15..0.80)) as u32;
         for y in y0..(y0 + bh).min(h) {
             for x in (w as f32 * 0.10) as u32..((w as f32 * 0.88) as u32).min(w) {
-                let i = ((y as usize) * (w as usize) + (x as usize)) * 3;
+                let pix = (y as usize) * (w as usize) + (x as usize);
+                let i = pix * 3;
                 for c in 0..3 {
                     buf[i + c] = buf[i + c] * 0.72 + col[c] * 0.28;
+                }
+                if let Some(ref mut am) = art_mask {
+                    am[pix] |= artifact_bits::HIGHLIGHTER;
                 }
             }
         }
@@ -1209,15 +1327,22 @@ fn degrade_image_inner(
             xb = xb.min(w as i64 - 1);
             for x in xa..=xb {
                 let d = (x as f32 - hw) * nx + (y as f32 - hh) * ny - off;
-                let i = ((y * w + x as u32) * 3) as usize;
+                let pix = (y * w + x as u32) as usize;
+                let i = pix * 3;
                 let av = d.abs();
                 if av < valley {
                     for c in 0..3 {
                         buf[i + c] *= 1.0 - 0.22 * cstr;
                     }
+                    if let Some(ref mut am) = art_mask {
+                        am[pix] |= artifact_bits::FOLD_CREASE;
+                    }
                 } else if (d - valley) > 0.0 && (d - valley) < 1.5 {
                     for c in 0..3 {
                         buf[i + c] = (buf[i + c] + 24.0 * cstr).clamp(0.0, 255.0);
+                    }
+                    if let Some(ref mut am) = art_mask {
+                        am[pix] |= artifact_bits::FOLD_CREASE;
                     }
                 } else if d < 0.0 && av < shade_w {
                     let f = 1.0 - 0.07 * cstr * (1.0 - av / shade_w);
@@ -1319,6 +1444,16 @@ fn degrade_image_inner(
     let shadow_angle_deg: f32 = rng.gen_range(0.0..360.0);
     let shadow_strength = s * rng.gen_range(0.15..0.45);
     let vignette_strength = s * rng.gen_range(0.05..0.25);
+    let awb_angle_deg: f32 = rng.gen_range(0.0..360.0);
+    let awb_warm_cool_strength = if cfg.realism.enable_awb && s > 0.05 {
+        s * rng.gen_range(0.18..0.55)
+    } else {
+        0.0
+    };
+    let (awb_dx, awb_dy) = (
+        awb_angle_deg.to_radians().cos(),
+        awb_angle_deg.to_radians().sin(),
+    );
     let ca_sampled = s * rng.gen_range(0.0..1.5) * rescale_k;
     let ca_px = if toggles.skip_chromatic {
         0.0
@@ -1339,7 +1474,34 @@ fn degrade_image_inner(
             shadow_strength,
             vignette_strength,
         );
-        banks::apply_lighting_field(&mut buf, &field);
+        if awb_warm_cool_strength > 0.0 {
+            let diag = (wf * wf + hf * hf).sqrt().max(1.0);
+            let cx = wf / 2.0;
+            let cy = hf / 2.0;
+            for y in 0..h {
+                for x in 0..w {
+                    let pix = (y * w + x) as usize;
+                    let i = pix * 3;
+                    let m = field.mult[pix];
+                    let add = field.add[pix];
+                    let g = realism::awb_channel_gains(
+                        x as f32,
+                        y as f32,
+                        cx,
+                        cy,
+                        diag,
+                        awb_dx,
+                        awb_dy,
+                        awb_warm_cool_strength,
+                    );
+                    buf[i] = buf[i] * m * g[0] + add;
+                    buf[i + 1] = buf[i + 1] * m * g[1] + add;
+                    buf[i + 2] = buf[i + 2] * m * g[2] + add;
+                }
+            }
+        } else {
+            banks::apply_lighting_field(&mut buf, &field);
+        }
         clamp_buf(&mut buf);
     }
     if !use_gpu && !toggles.fast_banks {
@@ -1362,9 +1524,19 @@ fn degrade_image_inner(
                 let cd = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() / max_d;
                 let vig = 1.0 - vignette_strength * cd * cd;
                 let m = (shadow * vig).max(0.0);
-                buf[i] = buf[i] * m + add;
-                buf[i + 1] = buf[i + 1] * m + add;
-                buf[i + 2] = buf[i + 2] * m + add;
+                let ag = realism::awb_channel_gains(
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    diag,
+                    awb_dx,
+                    awb_dy,
+                    awb_warm_cool_strength,
+                );
+                buf[i] = buf[i] * m * ag[0] + add;
+                buf[i + 1] = buf[i + 1] * m * ag[1] + add;
+                buf[i + 2] = buf[i + 2] * m * ag[2] + add;
             }
         }
         clamp_buf(&mut buf);
@@ -1393,16 +1565,30 @@ fn degrade_image_inner(
 
     // --- 5c. capture optics & handling ---
     let capture_p = capture::apply(&mut buf, w, h, &mut rng, s, rescale_k);
+    if let Some(ref mut am) = art_mask {
+        masks::stamp_capture_artifacts(am, art_w, art_h, &capture_p);
+    }
 
     tick!("capture");
 
-    // --- 6. sensor noise + 6b. capture downscale (fused on GPU) ---
+    // --- 5d. smartphone ISP unsharp-mask (USM) micro-contrast haloing ---
+    let usm_strength = realism::apply_usm(&mut buf, w, h, &mut rng, s, cfg.realism.enable_usm);
+
+    tick!("usm");
+
+    // --- 6. sensor noise (Poisson-Gaussian) + 6b. capture downscale (fused on GPU) ---
     let noise_sampled = s * rng.gen_range(3.0..14.0) * rescale_k;
     let noise_sigma = if toggles.skip_noise {
         0.0
     } else {
         noise_sampled
     };
+    let (noise_read_sigma, noise_shot_sigma) =
+        if cfg.realism.enable_shot_noise && noise_sigma > 0.05 {
+            (noise_sigma * 0.65, noise_sigma * 0.75)
+        } else {
+            (noise_sigma, 0.0)
+        };
 
     let (scale_x, scale_y) = {
         #[cfg(feature = "gpu")]
@@ -1436,9 +1622,13 @@ fn degrade_image_inner(
                     sh_dy: theta.sin(),
                     shadow_strength,
                     vignette_strength,
+                    awb_dx,
+                    awb_dy,
+                    awb_strength: awb_warm_cool_strength,
                 },
                 ca_px,
-                noise_sigma,
+                noise_sigma: noise_read_sigma,
+                noise_shot_sigma,
                 noise_seed: gpu_backend::noise_seed32(file_seed),
                 run_blur: tilt_branch || blur_sigma > 0.05,
                 run_light: true,
@@ -1470,7 +1660,8 @@ fn degrade_image_inner(
                 &mut h,
                 &mut rng,
                 file_seed,
-                noise_sigma,
+                noise_read_sigma,
+                noise_shot_sigma,
                 scale_min,
                 toggles,
             )?
@@ -1483,7 +1674,8 @@ fn degrade_image_inner(
                 &mut h,
                 &mut rng,
                 file_seed,
-                noise_sigma,
+                noise_read_sigma,
+                noise_shot_sigma,
                 scale_min,
                 toggles,
             )?
@@ -1492,23 +1684,19 @@ fn degrade_image_inner(
 
     tick!("noise+downscale");
 
+    // --- 6c. procedural desk surface + contact shadow + sheet-protector sheen ---
+    let desk_surface: String = if cfg.realism.enable_desk_surface && s > 0.05 {
+        ["walnut", "slate", "cloth"][rng.gen_range(0..3)].to_string()
+    } else {
+        "none".to_string()
+    };
+    let sheen = realism::SheenParams::sample(&mut rng, s, cfg.realism.enable_sheen);
+
     // --- 7. JPEG compression round-trip ---
     let jpeg_quality: u8 = match cfg.jpeg_quality {
         Some(q) => q,
         None => ((80.0 - s * 30.0 + rng.gen_range(-8.0..8.0)).clamp(30.0, 95.0)) as u8,
     };
-    let mut out_img = vec_to_image(&buf, w, h);
-    if jpeg_quality < 100 {
-        if let Ok((jpeg_bytes, _)) = encode_jpeg_bytes(out_img.as_raw(), w, h, jpeg_quality) {
-            if let Ok(dec) = decode_jpeg_bytes(&jpeg_bytes, "jpeg round-trip") {
-                if dec.width() == w && dec.height() == h {
-                    out_img = dec;
-                }
-            }
-        }
-    }
-
-    tick!("jpeg");
 
     let params = DegradeParams {
         input: String::new(),
@@ -1578,11 +1766,48 @@ fn degrade_image_inner(
         noise_sigma,
         jpeg_quality,
         codec: "zune".to_string(),
+        awb_warm_cool_strength,
+        usm_strength,
+        desk_surface: desk_surface.clone(),
+        crumple_strength,
+        sheen_strength: sheen.strength,
+    };
+
+    realism::apply_desk_and_sheen(&mut buf, &params, &desk_surface, &sheen, file_seed);
+    tick!("desk+sheen");
+
+    let mut out_img = vec_to_image(&buf, w, h);
+    if jpeg_quality < 100 {
+        if let Ok((jpeg_bytes, _)) = encode_jpeg_bytes(out_img.as_raw(), w, h, jpeg_quality) {
+            if let Ok(dec) = decode_jpeg_bytes(&jpeg_bytes, "jpeg round-trip") {
+                if dec.width() == w && dec.height() == h {
+                    out_img = dec;
+                }
+            }
+        }
+    }
+
+    tick!("jpeg");
+
+    let masks = if cfg.masks.any() {
+        let mut m = masks::build_masks(
+            &cfg.masks,
+            &params,
+            clean_luma.as_deref(),
+            art_mask.as_deref().map(|am| (am, art_w, art_h)),
+        );
+        if let Some(ref mut art) = m.artifacts {
+            realism::stamp_sheen_mask(art, params.width, params.height, &sheen);
+        }
+        Some(m)
+    } else {
+        None
     };
 
     Ok(DegradeResult {
         image: out_img,
         params,
+        masks,
     })
 }
 
@@ -1593,19 +1818,60 @@ fn run_cpu_noise_and_downscale(
     h: &mut u32,
     rng: &mut ChaCha8Rng,
     file_seed: u64,
-    noise_sigma: f32,
+    noise_read_sigma: f32,
+    noise_shot_sigma: f32,
     scale_min: f32,
     toggles: &StageToggles,
 ) -> Result<(f32, f32), String> {
-    if toggles.fast_banks && noise_sigma > 0.05 {
-        let bank =
-            banks::generate_gauss_bank(file_seed, banks::TAG_NOISE, banks::BANK_TILE, noise_sigma);
-        let (ox, oy) = banks::bank_offset(rng, banks::BANK_TILE);
-        banks::apply_noise_banked(buf, *w, &bank, banks::BANK_TILE, ox, oy);
+    let noise_active = noise_read_sigma > 0.05 || noise_shot_sigma > 0.05;
+    if toggles.fast_banks && noise_active {
+        if noise_shot_sigma > 0.0 {
+            let bank =
+                banks::generate_gauss_bank(file_seed, banks::TAG_NOISE, banks::BANK_TILE, 1.0);
+            let (ox, oy) = banks::bank_offset(rng, banks::BANK_TILE);
+            let tile = banks::BANK_TILE;
+            let t = tile as usize;
+            let n = bank.len();
+            let third = n / 3;
+            let stride = *w as usize;
+            let sr2 = noise_read_sigma * noise_read_sigma;
+            let ss2 = noise_shot_sigma * noise_shot_sigma;
+            for (pix, px) in buf.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let x = (pix % stride) as u32;
+                let y = (pix / stride) as u32;
+                let base = ((y + oy) % tile) as usize * t + ((x + ox) % tile) as usize;
+                let luma = ((px[0] + px[1] + px[2]) / (3.0 * 255.0)).max(0.01);
+                let eff = (sr2 + ss2 * luma).sqrt();
+                for c in 0..3 {
+                    px[c] += bank[(base + c * third) % n] * eff;
+                }
+            }
+        } else {
+            let bank = banks::generate_gauss_bank(
+                file_seed,
+                banks::TAG_NOISE,
+                banks::BANK_TILE,
+                noise_read_sigma,
+            );
+            let (ox, oy) = banks::bank_offset(rng, banks::BANK_TILE);
+            banks::apply_noise_banked(buf, *w, &bank, banks::BANK_TILE, ox, oy);
+        }
         clamp_buf(buf);
-    } else if noise_sigma > 0.05 {
-        for v in buf.iter_mut() {
-            *v += gauss(rng) * noise_sigma;
+    } else if noise_active {
+        if noise_shot_sigma > 0.0 {
+            let sr2 = noise_read_sigma * noise_read_sigma;
+            let ss2 = noise_shot_sigma * noise_shot_sigma;
+            for px in buf.as_chunks_mut::<3>().0 {
+                let luma = ((px[0] + px[1] + px[2]) / (3.0 * 255.0)).max(0.01);
+                let eff = (sr2 + ss2 * luma).sqrt();
+                for ch in px.iter_mut() {
+                    *ch += gauss(rng) * eff;
+                }
+            }
+        } else {
+            for v in buf.iter_mut() {
+                *v += gauss(rng) * noise_read_sigma;
+            }
         }
         clamp_buf(buf);
     }
@@ -1691,6 +1957,8 @@ mod tests {
             train_width: 0,
             scale_min: 1.0,
             toggles: StageToggles::default(),
+            realism: RealismConfig::default(),
+            masks: MaskRequest::none(),
         }
     }
 
