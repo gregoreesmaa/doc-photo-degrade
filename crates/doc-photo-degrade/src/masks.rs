@@ -5,10 +5,13 @@
 //! skipped completely with zero allocation and zero runtime overhead.
 
 use std::fmt;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use image::{GrayImage, ImageBuffer, ImageFormat, Luma, Rgb};
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ImageBuffer, Luma, Rgb};
 
 use crate::capture::CaptureParams;
 use crate::codecs::write_artifact;
@@ -208,10 +211,17 @@ impl DegradeMasks {
 
         if let Some(ref ink) = self.clean_ink {
             let p = dir.join(format!("{stem_prefix}_ink.png"));
-            let img = GrayImage::from_raw(w, h, ink.clone())
+            let img: ImageBuffer<Luma<u8>, &[u8]> = ImageBuffer::from_raw(w, h, ink.as_slice())
                 .ok_or_else(|| "clean_ink mask buffer size mismatch".to_string())?;
             write_artifact(&p, |tmp| {
-                img.save_with_format(tmp, ImageFormat::Png)
+                let f = File::create(tmp)
+                    .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+                let enc = PngEncoder::new_with_quality(
+                    BufWriter::new(f),
+                    CompressionType::Fast,
+                    FilterType::Sub,
+                );
+                img.write_with_encoder(enc)
                     .map_err(|e| format!("cannot write {}: {e}", tmp.display()))
             })?;
             written.push(p);
@@ -219,10 +229,18 @@ impl DegradeMasks {
 
         if let Some(ref art) = self.artifacts {
             let p = dir.join(format!("{stem_prefix}_artifacts.png"));
-            let img: ImageBuffer<Luma<u16>, Vec<u16>> = ImageBuffer::from_raw(w, h, art.clone())
-                .ok_or_else(|| "artifacts mask buffer size mismatch".to_string())?;
+            let img: ImageBuffer<Luma<u16>, &[u16]> =
+                ImageBuffer::from_raw(w, h, art.as_slice())
+                    .ok_or_else(|| "artifacts mask buffer size mismatch".to_string())?;
             write_artifact(&p, |tmp| {
-                img.save_with_format(tmp, ImageFormat::Png)
+                let f = File::create(tmp)
+                    .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+                let enc = PngEncoder::new_with_quality(
+                    BufWriter::new(f),
+                    CompressionType::Fast,
+                    FilterType::Sub,
+                );
+                img.write_with_encoder(enc)
                     .map_err(|e| format!("cannot write {}: {e}", tmp.display()))
             })?;
             written.push(p);
@@ -267,18 +285,26 @@ pub fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> Result<(), S
     let header_len =
         u16::try_from(header.len()).map_err(|_| "npy header exceeds v1.0 u16 limit".to_string())?;
 
-    let mut bytes = Vec::with_capacity(10 + header.len() + data.len() * 4);
-    bytes.extend_from_slice(b"\x93NUMPY");
-    bytes.push(1u8); // major version 1
-    bytes.push(0u8); // minor version 0
-    bytes.extend_from_slice(&header_len.to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
-    for &v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-
     write_artifact(path, |tmp| {
-        std::fs::write(tmp, &bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))
+        let f = File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let mut w = BufWriter::with_capacity(64 * 1024, f);
+        let mut write_all = |b: &[u8]| {
+            w.write_all(b)
+                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))
+        };
+        write_all(b"\x93NUMPY")?;
+        write_all(&[1u8, 0u8])?;
+        write_all(&header_len.to_le_bytes())?;
+        write_all(header.as_bytes())?;
+        for chunk in data.chunks(1024) {
+            let mut buf = [0u8; 4096];
+            for (i, &v) in chunk.iter().enumerate() {
+                buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            write_all(&buf[..chunk.len() * 4])?;
+        }
+        w.flush()
+            .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))
     })
 }
 
@@ -310,7 +336,10 @@ pub fn write_uv16_png(path: &Path, uv: &[f32], width: u32, height: u32) -> Resul
     let img: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::from_raw(width, height, raw)
         .ok_or_else(|| "uv16 PNG buffer size mismatch".to_string())?;
     write_artifact(path, |tmp| {
-        img.save_with_format(tmp, ImageFormat::Png)
+        let f = File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let enc =
+            PngEncoder::new_with_quality(BufWriter::new(f), CompressionType::Fast, FilterType::Sub);
+        img.write_with_encoder(enc)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))
     })
 }
@@ -338,7 +367,10 @@ pub fn write_illum_png(path: &Path, illum: &[f32], width: u32, height: u32) -> R
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(width, height, raw)
         .ok_or_else(|| "illumination PNG buffer size mismatch".to_string())?;
     write_artifact(path, |tmp| {
-        img.save_with_format(tmp, ImageFormat::Png)
+        let f = File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let enc =
+            PngEncoder::new_with_quality(BufWriter::new(f), CompressionType::Fast, FilterType::Sub);
+        img.write_with_encoder(enc)
             .map_err(|e| format!("cannot write {}: {e}", tmp.display()))
     })
 }
@@ -602,10 +634,13 @@ pub(crate) fn build_masks(
         let diag = lwf.hypot(lhf).max(1.0);
         let cx = lwf / 2.0;
         let cy = lhf / 2.0;
-        let max_d = cx.hypot(cy).max(1.0);
+        let max_d2 = (cx * cx + cy * cy).max(1.0);
+        let inv_max_d2 = 1.0 / max_d2;
         let gx = params.glare_center[0] as f64;
         let gy = params.glare_center[1] as f64;
         let glare_r = (params.glare_radius as f64).max(1e-6);
+        let glare_r2 = glare_r * glare_r;
+        let inv_glare_r = 1.0 / glare_r;
         let glare_a = params.glare_alpha as f64;
         let theta = (params.shadow_angle_deg as f64).to_radians();
         let (dx, dy) = (theta.cos(), theta.sin());
@@ -616,13 +651,20 @@ pub(crate) fn build_masks(
             for x in 0..w {
                 let idx = (y * w + x) as usize;
                 let (lx, ly) = ctx.to_lighting_coords(x as f64, y as f64);
-                let gd = (lx - gx).hypot(ly - gy);
-                let g = (1.0 - gd / glare_r).max(0.0);
-                let add_norm = (glare_a * g * g).clamp(0.0, 1.0);
-                let t = ((lx - cx) * dx + (ly - cy) * dy) / diag + 0.5;
+                let gdx = lx - gx;
+                let gdy = ly - gy;
+                let gd2 = gdx * gdx + gdy * gdy;
+                let add_norm = if gd2 < glare_r2 {
+                    let g = 1.0 - gd2.sqrt() * inv_glare_r;
+                    (glare_a * g * g).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let cdx = lx - cx;
+                let cdy = ly - cy;
+                let t = (cdx * dx + cdy * dy) / diag + 0.5;
                 let shadow = 1.0 - sh_str * t.clamp(0.0, 1.0);
-                let cd = (lx - cx).hypot(ly - cy) / max_d;
-                let vig = 1.0 - vig_str * cd * cd;
+                let vig = 1.0 - vig_str * (cdx * cdx + cdy * cdy) * inv_max_d2;
                 let mult = (shadow * vig).clamp(0.0, 1.0);
 
                 if let Some(ref mut il) = illumination {

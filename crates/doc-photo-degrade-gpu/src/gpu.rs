@@ -12,7 +12,7 @@
 // CPU `sample_bilinear` so outputs match within float-noise tolerance.
 // ---------------------------------------------------------------------------
 
-use super::chain::{rotation_dims, rotation_inv, ChainConfig, CHAIN_BLUR};
+use super::chain::{rotation_dims, rotation_inv, ChainConfig, BLUR_H_SHADER, BLUR_V_SHADER};
 
 const RESAMPLE_SHADER: &str = r#"
 struct Dims { src_w : u32, src_h : u32, dst_w : u32, dst_h : u32 }
@@ -240,6 +240,42 @@ pub fn run_pointwise(
     result
 }
 
+/// Reusable capacity-grown GPU scratch buffers pooled inside [`GpuContext`]
+/// to eliminate per-page VRAM allocation churn across batch runs.
+#[derive(Default)]
+struct BufferPool {
+    up: Option<(wgpu::Buffer, u64)>,
+    ping: Option<(wgpu::Buffer, u64)>,
+    pong: Option<(wgpu::Buffer, u64)>,
+    sharp: Option<(wgpu::Buffer, u64)>,
+    staging: Option<(wgpu::Buffer, u64)>,
+}
+
+impl BufferPool {
+    fn ensure(
+        slot: &mut Option<(wgpu::Buffer, u64)>,
+        device: &wgpu::Device,
+        label: &str,
+        min_bytes: u64,
+        usage: wgpu::BufferUsages,
+    ) {
+        let need = min_bytes.max(4);
+        let realloc = match slot {
+            Some((_, cap)) => *cap < need,
+            None => true,
+        };
+        if realloc {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: need,
+                usage,
+                mapped_at_creation: false,
+            });
+            *slot = Some((buf, need));
+        }
+    }
+}
+
 pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -249,11 +285,14 @@ pub struct GpuContext {
     ca_pipeline: wgpu::ComputePipeline,
     grain_pipeline: wgpu::ComputePipeline,
     bend_pipeline: wgpu::ComputePipeline,
-    /// Tilt-capable blur used by both `blur()` (uniform) and `chain_full()`
-    /// (uniform or tilt-shift smoothstep focus band).
-    chain_blur_pipeline: wgpu::ComputePipeline,
+    /// Separable 2-pass O(r) horizontal + vertical Gaussian blur pipelines
+    /// (with optional in-kernel tilt-shift & Petzval field-curvature blend).
+    blur_h_pipeline: wgpu::ComputePipeline,
+    blur_v_pipeline: wgpu::ComputePipeline,
     /// Fused rotate+downscale affine pass (`AFFINE_SHADER`).
     affine_pipeline: wgpu::ComputePipeline,
+    /// Capacity-grown reusable storage/staging buffers.
+    pool: std::sync::Mutex<BufferPool>,
 }
 
 /// Knobs for lighting stage 5: glare disc, shadow direction, vignette,
@@ -474,7 +513,8 @@ impl GpuContext {
         let ca_pipeline = make_pipeline(&device, "ca", CA_SHADER);
         let grain_pipeline = make_pipeline(&device, "grain", GRAIN_SHADER);
         let bend_pipeline = make_pipeline(&device, "bend", BEND_SHADER);
-        let chain_blur_pipeline = make_pipeline(&device, "chain-blur", CHAIN_BLUR);
+        let blur_h_pipeline = make_pipeline(&device, "blur-h", BLUR_H_SHADER);
+        let blur_v_pipeline = make_pipeline(&device, "blur-v", BLUR_V_SHADER);
         let affine_pipeline = make_pipeline(&device, "affine", AFFINE_SHADER);
         Ok(Self {
             device,
@@ -485,8 +525,10 @@ impl GpuContext {
             ca_pipeline,
             grain_pipeline,
             bend_pipeline,
-            chain_blur_pipeline,
+            blur_h_pipeline,
+            blur_v_pipeline,
             affine_pipeline,
+            pool: std::sync::Mutex::new(BufferPool::default()),
         })
     }
 
@@ -868,23 +910,16 @@ impl GpuContext {
         )
     }
 
-    /// Stage-4 gaussian defocus blur (clamped edges). Radius 0 = identity.
+    /// Stage-4 gaussian defocus blur (clamped edges, 2-pass separable H+V).
+    /// Radius 0 = identity.
     #[allow(dead_code)]
     pub fn blur(&self, src_host: &[f32], w: u32, h: u32, sigma: f32) -> Vec<f32> {
-        let radius = (3.0 * sigma).ceil().max(0.0);
-        let prm = [
-            sigma, radius, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
-        run_pointwise(
-            &self.device,
-            &self.queue,
-            &self.chain_blur_pipeline,
-            "blur",
-            src_host,
-            w,
-            h,
-            &prm,
-        )
+        let cfg = ChainConfig {
+            blur_sigma: sigma,
+            run_blur: true,
+            ..ChainConfig::default()
+        };
+        self.chain_full(src_host, w, h, &cfg).0
     }
 
     /// Resident single-submit run of the dense photo-degrade stages on the
@@ -893,24 +928,9 @@ impl GpuContext {
     /// (one compute pass per RUNNING stage), and ONE download. Returns
     /// `(pixels, out_w, out_h)`; rotation expands the canvas when enabled.
     ///
-    /// Skipped stages (`run_*` false) leave the resident buffers untouched,
-    /// exactly as if the stage gate failed in `photo-degrade`. The
-    /// `doc-photo-degrade --gpu` path calls this twice per file — pre-framing
-    /// (`run_grain/bend/persp`) and post-framing
-    /// (`run_rot/blur/light/ca/noise`) — because the CPU framing stage must
-    /// stay between the perspective warp and the rotation (the document
-    /// content bbox must see paper fill, not the rotation's dark-desk
-    /// triangles).
-    /// Each call is still a single submit on this shared context: no second
-    /// device and no per-stage round-trips.
-    ///
-    /// Kernels and param packing mirror the single-call methods above
-    /// (`grain`, `bend`, `resample`, `blur`, `lighting`, `chromatic`,
-    /// `noise`); the triple-proof test asserts bit-exactness vs the
-    /// sequential calls so the copies cannot drift silently. The blur pass
-    /// uses the tilt-capable `chain::CHAIN_BLUR` kernel (uniform mode is
-    /// bit-exact vs `blur()`; tilt mode blends sharp/blurred in-kernel with
-    /// the same smoothstep band the CPU focus stage uses).
+    /// Uses pooled capacity-grown GPU buffers (`up`, `ping`, `pong`, `sharp`,
+    /// `staging`) inside `GpuContext` to eliminate per-page VRAM allocation
+    /// churn across batch runs, and 2-pass separable H+V blur.
     #[allow(dead_code)]
     pub fn chain_full(
         &self,
@@ -931,83 +951,129 @@ impl GpuContext {
         } else {
             (w2, h2)
         };
+        let src_bytes = std::mem::size_of_val(src_host) as u64;
         let nmax = (w * h).max(w2 * h2).max(out_w * out_h) * 3;
         let bytes = (nmax as usize * std::mem::size_of::<f32>()) as u64;
-        let up = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chain-up"),
-                contents: bytemuck::cast_slice(src_host),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            });
-        let mk_resident = |label: &str| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let mut ping = mk_resident("chain-ping");
-        let mut pong = mk_resident("chain-pong");
+        let final_n = (out_w * out_h * 3) as usize;
+        let final_bytes = (final_n * std::mem::size_of::<f32>()) as u64;
+
+        let mut pool = self.pool.lock().expect("GPU buffer pool mutex poisoned");
+        let storage_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        BufferPool::ensure(
+            &mut pool.up,
+            &self.device,
+            "chain-up",
+            src_bytes,
+            storage_usage,
+        );
+        BufferPool::ensure(
+            &mut pool.ping,
+            &self.device,
+            "chain-ping",
+            bytes,
+            storage_usage,
+        );
+        BufferPool::ensure(
+            &mut pool.pong,
+            &self.device,
+            "chain-pong",
+            bytes,
+            storage_usage,
+        );
+        let need_sharp_buf = cfg.run_blur && (cfg.tilt_active || cfg.field_curvature > 0.0);
+        if need_sharp_buf {
+            let cur_blur_bytes = ((w2 * h2 * 3) as usize * std::mem::size_of::<f32>()) as u64;
+            BufferPool::ensure(
+                &mut pool.sharp,
+                &self.device,
+                "chain-sharp",
+                cur_blur_bytes,
+                storage_usage,
+            );
+        }
+        BufferPool::ensure(
+            &mut pool.staging,
+            &self.device,
+            "chain-staging",
+            final_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let up = &pool.up.as_ref().unwrap().0;
+        let ping = &pool.ping.as_ref().unwrap().0;
+        let pong = &pool.pong.as_ref().unwrap().0;
+        let sharp_opt = pool.sharp.as_ref().map(|(b, _)| b);
+        let staging = &pool.staging.as_ref().unwrap().0;
+
+        self.queue
+            .write_buffer(up, 0, bytemuck::cast_slice(src_host));
+
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut keep: Vec<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)> = Vec::new();
-        let mut head = true;
-        {
-            let mut dispatch = |pipe: &wgpu::ComputePipeline,
-                                tag: &str,
-                                src: &wgpu::Buffer,
-                                dst: &wgpu::Buffer,
-                                dims: [u32; 4],
-                                prm: &[f32]| {
-                let dims_buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(&dims),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-                let prm_buf = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(prm),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(tag),
-                    layout: &pipe.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: src.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: dst.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: dims_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: prm_buf.as_entire_binding(),
-                        },
-                    ],
+        // 0 = up, 1 = ping, 2 = pong
+        let mut cur: u8 = 0;
+        let buf_for = |id: u8| -> &wgpu::Buffer {
+            match id {
+                0 => up,
+                1 => ping,
+                _ => pong,
+            }
+        };
+        let dispatch = |enc: &mut wgpu::CommandEncoder,
+                        keep: &mut Vec<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)>,
+                        pipe: &wgpu::ComputePipeline,
+                        tag: &str,
+                        src: &wgpu::Buffer,
+                        dst: &wgpu::Buffer,
+                        dims: [u32; 4],
+                        prm: &[f32]| {
+            let dims_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&dims),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_pipeline(pipe);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.dispatch_workgroups(dims[2].div_ceil(16), dims[3].div_ceil(16), 1);
-                keep.push((bind, dims_buf, prm_buf));
-            };
+            let prm_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(prm),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(tag),
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: src.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dims_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: prm_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(dims[2].div_ceil(16), dims[3].div_ceil(16), 1);
+            keep.push((bind, dims_buf, prm_buf));
+        };
+        {
             // 1. grain (same dims). Packing mirrors `grain()`.
             if cfg.run_grain {
                 let prm = [
@@ -1028,17 +1094,18 @@ impl GpuContext {
                     0.0,
                     0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.grain_pipeline,
                     "c-grain",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w, h, w, h],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 2. bend (same dims). Packing mirrors `bend()`.
             if cfg.run_bend {
@@ -1061,17 +1128,18 @@ impl GpuContext {
                     b.light_lz,
                     b.normal_strength,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.bend_pipeline,
                     "c-bend",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w, h, w, h],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 3. perspective warp (same dims, paper-tone or desk-tone fill).
             if cfg.run_persp {
@@ -1081,17 +1149,18 @@ impl GpuContext {
                     inv[0], inv[1], inv[2], 0.0, inv[3], inv[4], inv[5], 0.0, inv[6], inv[7],
                     inv[8], 0.0, pf[0], pf[1], pf[2], 0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.resample_pipeline,
                     "c-persp",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w, h, w, h],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 4. rotation (canvas expands, desk-tone fill).
             if cfg.run_rot {
@@ -1100,19 +1169,22 @@ impl GpuContext {
                     rinv[0], rinv[1], rinv[2], 0.0, rinv[3], rinv[4], rinv[5], 0.0, rinv[6],
                     rinv[7], rinv[8], 0.0, 25.0, 25.0, 30.0, 0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.resample_pipeline,
                     "c-rot",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w, h, w2, h2],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
-            // 5. blur (+ optional in-kernel tilt blend & Petzval field curvature).
+            // 5. blur: 2-pass separable H+V Gaussian blur (+ optional in-kernel
+            // tilt blend & Petzval field curvature). Reuses ping/pong; keeps a
+            // sharp copy only when tilt_active || field_curvature > 0 and cur != 0.
             if cfg.run_blur {
                 let radius = (3.0 * cfg.blur_sigma).ceil().max(0.0);
                 let prm = [
@@ -1133,17 +1205,82 @@ impl GpuContext {
                     0.0,
                     0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let mid_id = if cur == 1 { 2 } else { 1 };
+                let dst_id = if cur == 1 { 1 } else { 2 };
+                let sharp_buf: &wgpu::Buffer = if need_sharp_buf {
+                    if cur == 0 {
+                        up
+                    } else {
+                        let sb = sharp_opt.expect("sharp pool buffer allocated");
+                        let cur_blur_bytes =
+                            ((w2 * h2 * 3) as usize * std::mem::size_of::<f32>()) as u64;
+                        enc.copy_buffer_to_buffer(buf_for(cur), 0, sb, 0, cur_blur_bytes);
+                        sb
+                    }
+                } else {
+                    buf_for(mid_id)
+                };
+                // Pass 5a: horizontal blur (cur -> mid)
                 dispatch(
-                    &self.chain_blur_pipeline,
-                    "c-blur",
-                    src,
-                    &ping,
+                    &mut enc,
+                    &mut keep,
+                    &self.blur_h_pipeline,
+                    "c-blur-h",
+                    buf_for(cur),
+                    buf_for(mid_id),
                     [w2, h2, w2, h2],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                // Pass 5b: vertical blur + optional tilt/FC blend (mid + sharp -> dst)
+                let dims_v: [u32; 4] = [w2, h2, w2, h2];
+                let dims_buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(&dims_v),
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    });
+                let prm_buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(&prm),
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    });
+                let bind_v = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("c-blur-v"),
+                    layout: &self.blur_v_pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf_for(mid_id).as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: buf_for(dst_id).as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: dims_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: prm_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: sharp_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    pass.set_pipeline(&self.blur_v_pipeline);
+                    pass.set_bind_group(0, &bind_v, &[]);
+                    pass.dispatch_workgroups(w2.div_ceil(16), h2.div_ceil(16), 1);
+                }
+                keep.push((bind_v, dims_buf, prm_buf));
+                cur = dst_id;
             }
             // 6. lighting (128 B uniform: glare + shadow + vig + AWB + phone shadow + specular bloom).
             if cfg.run_light {
@@ -1183,17 +1320,18 @@ impl GpuContext {
                     k.spec_aspect,
                     k.spec_rolloff,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.lighting_pipeline,
                     "c-light",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w2, h2, w2, h2],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 7. chromatic aberration (legacy linear or off-axis cubic radial).
             if cfg.run_ca {
@@ -1230,17 +1368,18 @@ impl GpuContext {
                     0.0,
                     0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.ca_pipeline,
                     "c-ca",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w2, h2, w2, h2],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 8. sensor noise (read + Poisson shot + 1/4-res chroma blotch).
             if cfg.run_noise {
@@ -1262,48 +1401,42 @@ impl GpuContext {
                     0.0,
                     0.0,
                 ];
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.noise_pipeline,
                     "c-noise",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w2, h2, w2, h2],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
             // 9. terminal fused rotate+downscale affine pass (desk-tone fill).
             if cfg.run_affine {
                 let prm = rotscale_prm(cfg.affine_rows, cfg.affine_meta, [25.0, 25.0, 30.0]);
-                let src = if head { &up } else { &pong };
+                let dst_id = if cur == 1 { 2 } else { 1 };
                 dispatch(
+                    &mut enc,
+                    &mut keep,
                     &self.affine_pipeline,
                     "c-affine",
-                    src,
-                    &ping,
+                    buf_for(cur),
+                    buf_for(dst_id),
                     [w2, h2, out_w, out_h],
                     &prm,
                 );
-                std::mem::swap(&mut ping, &mut pong);
-                head = false;
+                cur = dst_id;
             }
         }
         // Single download of the final resident buffer (`up` is still
         // current when every stage was skipped).
-        let final_n = (out_w * out_h * 3) as usize;
-        let final_bytes = (final_n * std::mem::size_of::<f32>()) as u64;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chain-staging"),
-            size: final_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let done = if head { &up } else { &pong };
-        enc.copy_buffer_to_buffer(done, 0, &staging, 0, final_bytes);
+        let done = buf_for(cur);
+        enc.copy_buffer_to_buffer(done, 0, staging, 0, final_bytes);
         self.queue.submit(Some(enc.finish()));
-        let slice = staging.slice(..);
+        let slice = staging.slice(0..final_bytes);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
@@ -1707,21 +1840,20 @@ struct Ca { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
 @group(0) @binding(2) var<uniform> dims : Dims;
 @group(0) @binding(3) var<uniform> prm : Ca;
 
-fn tap(ix : i32, iy : i32) -> vec3<f32> {
+fn tap_ch(ix : i32, iy : i32, ch : u32, fill : f32) -> f32 {
     if (ix < 0 || iy < 0 || ix >= i32(dims.src_w) || iy >= i32(dims.src_h)) {
-        return vec3<f32>(prm.b.x, prm.b.y, prm.b.z);
+        return fill;
     }
-    let i = (u32(iy) * dims.src_w + u32(ix)) * 3u;
-    return vec3<f32>(src[i], src[i + 1u], src[i + 2u]);
+    return src[(u32(iy) * dims.src_w + u32(ix)) * 3u + ch];
 }
 
-fn sample_at(sx : f32, sy : f32) -> vec3<f32> {
+fn sample_ch(sx : f32, sy : f32, ch : u32, fill : f32) -> f32 {
     let x0 = i32(floor(sx));
     let y0 = i32(floor(sy));
     let tx = sx - f32(x0);
     let ty = sy - f32(y0);
-    let top = tap(x0, y0) * (1.0 - tx) + tap(x0 + 1, y0) * tx;
-    let bot = tap(x0, y0 + 1) * (1.0 - tx) + tap(x0 + 1, y0 + 1) * tx;
+    let top = tap_ch(x0, y0, ch, fill) * (1.0 - tx) + tap_ch(x0 + 1, y0, ch, fill) * tx;
+    let bot = tap_ch(x0, y0 + 1, ch, fill) * (1.0 - tx) + tap_ch(x0 + 1, y0 + 1, ch, fill) * tx;
     return top * (1.0 - ty) + bot * ty;
 }
 
@@ -1737,12 +1869,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cubic = prm.c.x;
     let r2 = min(dx * dx + dy * dy, 1.5);
     let gain = ((1.0 - cubic) + cubic * r2) * prm.b.w;
-    let r = sample_at(fx - dx * gain * prm.c.y, fy - dy * gain * prm.c.y);
-    let b = sample_at(fx + dx * gain * prm.c.z, fy + dy * gain * prm.c.z);
+    let r = sample_ch(fx - dx * gain * prm.c.y, fy - dy * gain * prm.c.y, 0u, prm.b.x);
+    let b = sample_ch(fx + dx * gain * prm.c.z, fy + dy * gain * prm.c.z, 2u, prm.b.z);
     let i = (y * dims.src_w + x) * 3u;
-    dst[i] = clamp(r.x, 0.0, 255.0);
+    dst[i] = clamp(r, 0.0, 255.0);
     dst[i + 1u] = clamp(src[i + 1u], 0.0, 255.0);
-    dst[i + 2u] = clamp(b.z, 0.0, 255.0);
+    dst[i + 2u] = clamp(b, 0.0, 255.0);
 }
 "#;
 

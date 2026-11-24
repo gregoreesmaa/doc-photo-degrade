@@ -21,6 +21,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::RgbImage;
 
@@ -430,37 +431,47 @@ impl Degrader {
             .unwrap_or(4)
             .max(1)
             .min(images.len());
-        let chunk_size = images.len().div_ceil(n_threads);
-        let mut chunk_results: Vec<Result<Vec<DegradeResult>, DegradeError>> =
+        let next_idx = AtomicUsize::new(0);
+        let mut worker_results: Vec<Result<Vec<(usize, DegradeResult)>, DegradeError>> =
             Vec::with_capacity(n_threads);
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(n_threads);
-            for (ci, chunk) in images.chunks(chunk_size).enumerate() {
-                let base = ci * chunk_size;
+            for _ in 0..n_threads {
+                let next_idx = &next_idx;
                 handles.push(scope.spawn(move || {
-                    let mut local = Vec::with_capacity(chunk.len());
-                    for (j, img) in chunk.iter().enumerate() {
-                        let i = base + j;
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if i >= images.len() {
+                            break;
+                        }
                         let item_seed =
                             base_seed.wrapping_add((i as u64).wrapping_mul(GOLDEN_RATIO_U64));
-                        local.push(self.degrade_image(img, item_seed)?);
+                        local.push((i, self.degrade_image(images[i], item_seed)?));
                     }
                     Ok(local)
                 }));
             }
             for h in handles {
-                chunk_results.push(h.join().unwrap_or_else(|_| {
+                worker_results.push(h.join().unwrap_or_else(|_| {
                     Err(DegradeError::Processing("worker thread panicked".into()))
                 }));
             }
         });
 
-        let mut out = Vec::with_capacity(images.len());
-        for res in chunk_results {
-            out.extend(res?);
+        let mut slots: Vec<Option<DegradeResult>> = (0..images.len()).map(|_| None).collect();
+        for res in worker_results {
+            for (i, item) in res? {
+                slots[i] = Some(item);
+            }
         }
-        Ok(out)
+        slots
+            .into_iter()
+            .map(|opt| {
+                opt.ok_or_else(|| DegradeError::Processing("missing batch output item".into()))
+            })
+            .collect()
     }
 }
 

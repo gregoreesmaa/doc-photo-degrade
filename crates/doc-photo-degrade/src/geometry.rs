@@ -145,6 +145,32 @@ impl QuadSdf2D {
         };
         (d, n)
     }
+
+    /// Returns the continuous horizontal interval `[x_min, x_max]` along scanline `py`
+    /// where `(px, py)` lies inside or on the boundary of this convex quad, or `None`
+    /// if the scanline does not intersect the quad.
+    #[inline]
+    pub(crate) fn scanline_x_interval(&self, py: f64) -> Option<(f64, f64)> {
+        let mut x_min = f64::NEG_INFINITY;
+        let mut x_max = f64::INFINITY;
+        for k in 0..4 {
+            let nx = self.n_out[k].0;
+            let ny = self.n_out[k].1;
+            let rhs = self.v[k].0 * nx - (py - self.v[k].1) * ny;
+            if nx > 1e-12 {
+                x_max = x_max.min(rhs / nx);
+            } else if nx < -1e-12 {
+                x_min = x_min.max(rhs / nx);
+            } else if (py - self.v[k].1) * ny > 0.0 {
+                return None;
+            }
+        }
+        if x_min <= x_max {
+            Some((x_min, x_max))
+        } else {
+            None
+        }
+    }
 }
 
 /// Sample & clamp independent per-corner detachment (`inset` | `offset`) composed

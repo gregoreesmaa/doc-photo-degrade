@@ -15,10 +15,8 @@
 
 use super::gpu::{BendKnobs, LightingKnobs};
 
-/// Tilt-capable Gaussian defocus blur shader used by both `GpuContext::blur`
-/// (with `b.x == 0`, pure uniform blur) and `GpuContext::chain_full` (uniform
-/// or tilt-shift smoothstep focus band).
-pub(crate) const CHAIN_BLUR: &str = r#"
+/// Separable 1D horizontal Gaussian blur shader (pass 1 of 2-pass O(r) blur).
+pub(crate) const BLUR_H_SHADER: &str = r#"
 struct Dims { src_w : u32, src_h : u32, dst_w : u32, dst_h : u32 }
 struct Blr { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
 
@@ -27,10 +25,9 @@ struct Blr { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
 @group(0) @binding(2) var<uniform> dims : Dims;
 @group(0) @binding(3) var<uniform> prm : Blr;
 
-fn tap(ix : i32, iy : i32) -> vec3<f32> {
+fn tap(ix : i32, y : u32) -> vec3<f32> {
     let cx = clamp(ix, 0, i32(dims.src_w) - 1);
-    let cy = clamp(iy, 0, i32(dims.src_h) - 1);
-    let i = (u32(cy) * dims.src_w + u32(cx)) * 3u;
+    let i = (y * dims.src_w + u32(cx)) * 3u;
     return vec3<f32>(src[i], src[i + 1u], src[i + 2u]);
 }
 
@@ -40,8 +37,55 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let y = gid.y;
     if (x >= dims.dst_w || y >= dims.dst_h) { return; }
     let r = i32(prm.a.y);
+    let i = (y * dims.dst_w + x) * 3u;
     if (r <= 0) {
-        let i = (y * dims.src_w + x) * 3u;
+        dst[i] = src[i];
+        dst[i + 1u] = src[i + 1u];
+        dst[i + 2u] = src[i + 2u];
+        return;
+    }
+    let s2 = 2.0 * prm.a.x * prm.a.x;
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    var norm = 0.0;
+    for (var kx = -r; kx <= r; kx++) {
+        let wgt = exp(-f32(kx * kx) / s2);
+        acc += tap(i32(x) + kx, y) * wgt;
+        norm += wgt;
+    }
+    let out = acc / norm;
+    dst[i] = out.x;
+    dst[i + 1u] = out.y;
+    dst[i + 2u] = out.z;
+}
+"#;
+
+/// Separable 1D vertical Gaussian blur shader (pass 2 of 2-pass O(r) blur)
+/// with optional in-kernel tilt-shift focus band & Petzval field-curvature
+/// blend against the pre-blur `sharp` buffer.
+pub(crate) const BLUR_V_SHADER: &str = r#"
+struct Dims { src_w : u32, src_h : u32, dst_w : u32, dst_h : u32 }
+struct Blr { a : vec4<f32>, b : vec4<f32>, c : vec4<f32>, d : vec4<f32> }
+
+@group(0) @binding(0) var<storage, read> src : array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst : array<f32>;
+@group(0) @binding(2) var<uniform> dims : Dims;
+@group(0) @binding(3) var<uniform> prm : Blr;
+@group(0) @binding(4) var<storage, read> sharp : array<f32>;
+
+fn tap(x : u32, iy : i32) -> vec3<f32> {
+    let cy = clamp(iy, 0, i32(dims.src_h) - 1);
+    let i = (u32(cy) * dims.src_w + x) * 3u;
+    return vec3<f32>(src[i], src[i + 1u], src[i + 2u]);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= dims.dst_w || y >= dims.dst_h) { return; }
+    let r = i32(prm.a.y);
+    let i = (y * dims.dst_w + x) * 3u;
+    if (r <= 0) {
         dst[i] = src[i];
         dst[i + 1u] = src[i + 1u];
         dst[i + 2u] = src[i + 2u];
@@ -51,11 +95,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var acc = vec3<f32>(0.0, 0.0, 0.0);
     var norm = 0.0;
     for (var ky = -r; ky <= r; ky++) {
-        for (var kx = -r; kx <= r; kx++) {
-            let wgt = exp(-f32(kx * kx + ky * ky) / s2);
-            acc += tap(i32(x) + kx, i32(y) + ky) * wgt;
-            norm += wgt;
-        }
+        let wgt = exp(-f32(ky * ky) / s2);
+        acc += tap(x, i32(y) + ky) * wgt;
+        norm += wgt;
     }
     let blurred = acc / norm;
     var out = blurred;
@@ -76,10 +118,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
             let m_fc = fc * t * t * (3.0 - 2.0 * t);
             m = select(clamp(0.45 + 0.55 * m_fc, 0.0, 1.0), max(m, m_fc), prm.b.x > 0.5);
         }
-        let sharp = tap(i32(x), i32(y));
-        out = mix(sharp, blurred, m);
+        let sp = vec3<f32>(sharp[i], sharp[i + 1u], sharp[i + 2u]);
+        out = mix(sp, blurred, m);
     }
-    let i = (y * dims.dst_w + x) * 3u;
     dst[i] = out.x;
     dst[i + 1u] = out.y;
     dst[i + 2u] = out.z;

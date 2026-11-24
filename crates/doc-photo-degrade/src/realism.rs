@@ -298,7 +298,8 @@ pub(crate) fn phone_shadow_gains(p: &PhoneShadowParams, u: f32, v: f32) -> [f32;
     let r = 0.025;
     let qx = lx.abs() - (p.hw - r);
     let qy = ly.abs() - (p.hh - r);
-    let d_phone = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+    let (mx, my) = (qx.max(0.0), qy.max(0.0));
+    let d_phone = (mx * mx + my * my).sqrt() + qx.max(qy).min(0.0) - r;
     let ax = p.hand_side * p.hw * 0.85;
     let ay = p.hh * 0.15;
     let bx = p.hand_side * (p.hw + 0.24);
@@ -308,7 +309,8 @@ pub(crate) fn phone_shadow_gains(p: &PhoneShadowParams, u: f32, v: f32) -> [f32;
     let bax = bx - ax;
     let bay = by - ay;
     let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay).max(1e-6)).clamp(0.0, 1.0);
-    let d_hand = (pax - bax * h).hypot(pay - bay * h) - (0.095 + 0.045 * h);
+    let (hx, hy) = (pax - bax * h, pay - bay * h);
+    let d_hand = (hx * hx + hy * hy).sqrt() - (0.095 + 0.045 * h);
     let k = 0.045;
     let sm = (k - (d_phone - d_hand).abs()).max(0.0) / k;
     let d = d_phone.min(d_hand) - sm * sm * k * 0.25;
@@ -1137,20 +1139,60 @@ impl SheenParams {
     }
 
     #[inline]
+    pub(crate) fn prepare(&self, wf: f32, hf: f32) -> SheenEval {
+        let min_d = wf.min(hf).max(1.0);
+        let (nx, ny) = (self.angle_rad.cos(), self.angle_rad.sin());
+        SheenEval {
+            strength: self.strength,
+            nx,
+            ny,
+            tx: -ny,
+            ty: nx,
+            half_w: wf * 0.5,
+            half_h: hf * 0.5,
+            off: (self.pos - 0.5) * min_d,
+            inv_min_d: 1.0 / min_d,
+            inv_band_w: 1.0 / (self.width_frac * min_d).max(4.0),
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
     pub(crate) fn eval(&self, x: f32, y: f32, wf: f32, hf: f32) -> f32 {
+        self.prepare(wf, hf).eval(x, y)
+    }
+}
+
+/// Precomputed per-image sheen evaluator (hoists `cos`/`sin`/reciprocals and
+/// early-rejects `|d / band_w| > 3.5` before `exp()`/`cos()`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SheenEval {
+    strength: f32,
+    nx: f32,
+    ny: f32,
+    tx: f32,
+    ty: f32,
+    half_w: f32,
+    half_h: f32,
+    off: f32,
+    inv_min_d: f32,
+    inv_band_w: f32,
+}
+
+impl SheenEval {
+    #[inline]
+    pub(crate) fn eval(&self, x: f32, y: f32) -> f32 {
         if self.strength <= 0.0 {
             return 0.0;
         }
-        let min_d = wf.min(hf).max(1.0);
-        let (nx, ny) = (self.angle_rad.cos(), self.angle_rad.sin());
-        let (tx, ty) = (-ny, nx);
-        let cx = x - wf * 0.5;
-        let cy = y - hf * 0.5;
-        let off = (self.pos - 0.5) * min_d;
-        let d = cx * nx + cy * ny - off;
-        let along = (cx * tx + cy * ty) / min_d;
-        let band_w = (self.width_frac * min_d).max(4.0);
-        let gauss = (-(d / band_w).powi(2)).exp();
+        let cx = x - self.half_w;
+        let cy = y - self.half_h;
+        let d_norm = (cx * self.nx + cy * self.ny - self.off) * self.inv_band_w;
+        if d_norm.abs() > 3.5 {
+            return 0.0;
+        }
+        let gauss = (-(d_norm * d_norm)).exp();
+        let along = (cx * self.tx + cy * self.ty) * self.inv_min_d;
         let mod_along = 0.72 + 0.28 * (along * 3.5).cos();
         self.strength * gauss * mod_along
     }
@@ -1277,51 +1319,91 @@ pub(crate) fn apply_desk_and_sheen(
 
     if run_desk || run_sheen {
         let lut_ref = lut.as_ref();
+        let sheen_ev = sheen.prepare(wf, hf);
+        let shade_border_px = |buf: &mut [f32], x: u32, y: u32, fy: f64| {
+            let fx = x as f64;
+            let idx = ((y * w + x) * 3) as usize;
+
+            let (dq, nq) = sdf_q.outside_dist_and_normal(fx, fy);
+            let (dr, nr) = sdf_r.outside_dist_and_normal(fx, fy);
+            let (dist_out, (ox, oy)) = if dq >= dr { (dq, nq) } else { (dr, nr) };
+
+            if dist_out > 0.0 {
+                if let Some(dl) = lut_ref {
+                    if run_desk {
+                        let mut tex =
+                            desk_pixel_fast(dl, desk_surface, x as f32, y as f32, wa_cos, wa_sin);
+                        let align = (ox * sh_dx + oy * sh_dy).clamp(-1.0, 1.0);
+                        let dir_bias = (0.65 + 0.35 * align).max(0.25);
+                        let eff_rad = shadow_radius * dir_bias;
+                        let ao = 0.25 * (-dist_out / 3.0).exp();
+                        let drop_sh = 0.55 * (-dist_out / eff_rad).exp();
+                        let shadow_mul = (1.0 - (ao + drop_sh).min(0.72)) as f32;
+                        tex[0] *= shadow_mul;
+                        tex[1] *= shadow_mul;
+                        tex[2] *= shadow_mul;
+                        let a = (dist_out / 1.5).clamp(0.0, 1.0) as f32;
+                        buf[idx] = buf[idx] * (1.0 - a) + tex[0] * a;
+                        buf[idx + 1] = buf[idx + 1] * (1.0 - a) + tex[1] * a;
+                        buf[idx + 2] = buf[idx + 2] * (1.0 - a) + tex[2] * a;
+                    }
+                }
+            } else if run_sheen {
+                let s_val = sheen_ev.eval(x as f32, y as f32);
+                if s_val > 1e-4 {
+                    let add = s_val * 255.0;
+                    buf[idx] = (buf[idx] + add).clamp(0.0, 255.0);
+                    buf[idx + 1] = (buf[idx + 1] + add).clamp(0.0, 255.0);
+                    buf[idx + 2] = (buf[idx + 2] + add).clamp(0.0, 255.0);
+                }
+            }
+        };
+
         for y in 0..h {
             let fy = y as f64;
-            for x in 0..w {
-                let fx = x as f64;
-                let idx = ((y * w + x) * 3) as usize;
-
-                let (dq, nq) = sdf_q.outside_dist_and_normal(fx, fy);
-                let (dr, nr) = sdf_r.outside_dist_and_normal(fx, fy);
-                let (dist_out, (ox, oy)) = if dq >= dr { (dq, nq) } else { (dr, nr) };
-
-                if dist_out > 0.0 {
-                    if let Some(dl) = lut_ref {
-                        if run_desk {
-                            let mut tex = desk_pixel_fast(
-                                dl,
-                                desk_surface,
-                                x as f32,
-                                y as f32,
-                                wa_cos,
-                                wa_sin,
-                            );
-                            let align = (ox * sh_dx + oy * sh_dy).clamp(-1.0, 1.0);
-                            let dir_bias = (0.65 + 0.35 * align).max(0.25);
-                            let eff_rad = shadow_radius * dir_bias;
-                            let ao = 0.25 * (-dist_out / 3.0).exp();
-                            let drop_sh = 0.55 * (-dist_out / eff_rad).exp();
-                            let shadow_mul = (1.0 - (ao + drop_sh).min(0.72)) as f32;
-                            tex[0] *= shadow_mul;
-                            tex[1] *= shadow_mul;
-                            tex[2] *= shadow_mul;
-                            let a = (dist_out / 1.5).clamp(0.0, 1.0) as f32;
-                            buf[idx] = buf[idx] * (1.0 - a) + tex[0] * a;
-                            buf[idx + 1] = buf[idx + 1] * (1.0 - a) + tex[1] * a;
-                            buf[idx + 2] = buf[idx + 2] * (1.0 - a) + tex[2] * a;
+            // Scanline convex-interval clipping for Q_out ∩ R_out:
+            // shrink by 1 px on each side so every pixel in [in_lo, in_hi) is
+            // strictly inside both quads (0 SDF calls, and skipped completely
+            // when !run_sheen).
+            let (in_lo, in_hi) =
+                match (sdf_q.scanline_x_interval(fy), sdf_r.scanline_x_interval(fy)) {
+                    (Some((ql, qr)), Some((rl, rr))) => {
+                        let lo_f = ql.max(rl);
+                        let hi_f = qr.min(rr);
+                        if lo_f + 2.0 <= hi_f {
+                            let lo = (lo_f.ceil() as i64 + 1).clamp(0, w as i64) as u32;
+                            let hi = (hi_f.floor() as i64).clamp(0, w as i64) as u32;
+                            if lo < hi {
+                                (lo, hi)
+                            } else {
+                                (w, w)
+                            }
+                        } else {
+                            (w, w)
                         }
                     }
-                } else if run_sheen {
-                    let s_val = sheen.eval(x as f32, y as f32, wf, hf);
+                    _ => (w, w),
+                };
+
+            for x in 0..in_lo {
+                shade_border_px(buf, x, y, fy);
+            }
+            if run_sheen && in_lo < in_hi {
+                let yf = y as f32;
+                let row_base = (y * w) as usize * 3;
+                for x in in_lo..in_hi {
+                    let s_val = sheen_ev.eval(x as f32, yf);
                     if s_val > 1e-4 {
                         let add = s_val * 255.0;
+                        let idx = row_base + (x as usize) * 3;
                         buf[idx] = (buf[idx] + add).clamp(0.0, 255.0);
                         buf[idx + 1] = (buf[idx + 1] + add).clamp(0.0, 255.0);
                         buf[idx + 2] = (buf[idx + 2] + add).clamp(0.0, 255.0);
                     }
                 }
+            }
+            for x in in_hi..w {
+                shade_border_px(buf, x, y, fy);
             }
         }
     }
@@ -1589,13 +1671,13 @@ pub(crate) fn stamp_realism_masks(
         return;
     }
     if sheen.strength > 0.0 {
-        let wf = w as f32;
-        let hf = h as f32;
+        let sheen_ev = sheen.prepare(w as f32, h as f32);
         for y in 0..h {
+            let yf = y as f32;
             for x in 0..w {
                 let idx = (y * w + x) as usize;
                 if (art[idx] & artifact_bits::OUT_OF_PAGE) == 0
-                    && sheen.eval(x as f32, y as f32, wf, hf) > 0.04
+                    && sheen_ev.eval(x as f32, yf) > 0.04
                 {
                     art[idx] |= artifact_bits::GLARE;
                 }

@@ -74,18 +74,23 @@ fn box_blur_flipped(snap: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
             acc = acc - drop + add;
         }
     }
-    // Vertical pass over the row means.
+    // Vertical pass over the row means (row-major with a `w`-len accumulator
+    // for cache-linear traversal; bit-exact with the column-major loop).
     let mut out = vec![0.0f32; w * h];
-    for x in 0..w {
-        let mut acc = 0.0f32;
-        for oy in -r..=r {
-            acc += tmp[oy.clamp(0, h as i32 - 1) as usize * w + x];
+    let mut acc = vec![0.0f32; w];
+    for oy in -r..=r {
+        let src_row = &tmp[oy.clamp(0, h as i32 - 1) as usize * w..][..w];
+        for (a, &v) in acc.iter_mut().zip(src_row) {
+            *a += v;
         }
-        for y in 0..h {
-            out[y * w + x] = acc / n;
-            let drop = tmp[(y as i32 - r).clamp(0, h as i32 - 1) as usize * w + x];
-            let add = tmp[(y as i32 + r + 1).clamp(0, h as i32 - 1) as usize * w + x];
-            acc = acc - drop + add;
+    }
+    for y in 0..h {
+        let out_row = &mut out[y * w..(y + 1) * w];
+        let drop_row = &tmp[(y as i32 - r).clamp(0, h as i32 - 1) as usize * w..][..w];
+        let add_row = &tmp[(y as i32 + r + 1).clamp(0, h as i32 - 1) as usize * w..][..w];
+        for x in 0..w {
+            out_row[x] = acc[x] / n;
+            acc[x] = acc[x] - drop_row[x] + add_row[x];
         }
     }
     out
@@ -427,26 +432,24 @@ pub(crate) fn apply_ink_micro_texture(
         -0.94, 0.06, -0.69, 0.31, 0.56, -0.44, 0.81, -0.19, -0.56, 0.44, -0.81, 0.19, 0.94, -0.06,
         0.69, -0.31,
     ];
-    let snap: Vec<f32> = buf
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])
-        .collect();
+    let mut row_luma = vec![0.0f32; wsz];
 
     for y in 0..hsz {
         let row = y * wsz;
+        let row_rgb = &buf[row * 3..(row + wsz) * 3];
+        for (dst, p) in row_luma.iter_mut().zip(row_rgb.as_chunks::<3>().0) {
+            *dst = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+        }
         let brow = (y & mask) * tile;
         let by4 = (y & 3) * 4;
         for x in 0..wsz {
-            let idx = row + x;
-            let l = snap[idx];
+            let l = row_luma[x];
             if l >= 140.0 {
                 continue;
             }
             let b_val = bank[brow + (x & mask)];
-            let lx = if x > 0 { snap[idx - 1] } else { l };
-            let rx = if x + 1 < wsz { snap[idx + 1] } else { l };
+            let lx = if x > 0 { row_luma[x - 1] } else { l };
+            let rx = if x + 1 < wsz { row_luma[x + 1] } else { l };
             let is_edge = (lx - l).abs() > 35.0 || (rx - l).abs() > 35.0;
             let ink_w = ((140.0 - l) / 140.0).clamp(0.0, 1.0);
             let mut delta = b_val * grain_sigma * (0.45 + 0.55 * ink_w);
@@ -456,7 +459,7 @@ pub(crate) fn apply_ink_micro_texture(
             if halftone_amp > 0.0 {
                 delta += BAYER4[by4 + (x & 3)] * halftone_amp * ink_w;
             }
-            let j = idx * 3;
+            let j = (row + x) * 3;
             buf[j] = (buf[j] + delta).clamp(0.0, 255.0);
             buf[j + 1] = (buf[j + 1] + delta).clamp(0.0, 255.0);
             buf[j + 2] = (buf[j + 2] + delta).clamp(0.0, 255.0);

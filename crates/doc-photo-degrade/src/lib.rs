@@ -2914,9 +2914,9 @@ mod tests {
     #[test]
     fn train_width_downscales_and_records_rescale() {
         let dir = test_dir("trainres");
-        let input = document_input(&dir, "in.png", 1500, 2100);
+        let input = document_input(&dir, "in.png", 300, 420);
         let mut cfg = cfg_base(42, 0.6);
-        cfg.train_width = 1024;
+        cfg.train_width = 200;
         let a = degrade_file(&input, &cfg).unwrap();
         let b = degrade_file(&input, &cfg).unwrap();
         assert_eq!(a.image.as_raw(), b.image.as_raw());
@@ -2924,15 +2924,15 @@ mod tests {
             serde_json::to_string(&a.params).unwrap(),
             serde_json::to_string(&b.params).unwrap()
         );
-        assert_eq!(a.params.train_width, 1024);
-        assert_eq!((a.params.src_width, a.params.src_height), (1500, 2100));
-        let k = 1024.0f32 / 1500.0;
+        assert_eq!(a.params.train_width, 200);
+        assert_eq!((a.params.src_width, a.params.src_height), (300, 420));
+        let k = 200.0f32 / 300.0;
         assert!((a.params.rescale_k - k).abs() < 1e-6);
         assert_eq!(
             (a.image.width(), a.image.height()),
             (a.params.width, a.params.height)
         );
-        assert!(a.image.width() <= 1500);
+        assert!(a.image.width() <= 300);
         assert!(a.params.paper_grain_sigma <= 3.0 * k + 1e-4);
         assert!(a.params.noise_sigma <= 14.0 * 0.6 * k + 1e-4);
         assert!(a.params.blur_sigma <= 2.4 * 0.6 * k + 1e-4);
@@ -2943,24 +2943,24 @@ mod tests {
         let off_p = degrade_file(&input, &cfg_base(42, 0.6)).unwrap().params;
         assert_eq!(off_p.train_width, 0);
         assert!((off_p.rescale_k - 1.0).abs() < 1e-9);
-        let narrow = document_input(&dir, "narrow.png", 400, 560);
+        let narrow = document_input(&dir, "narrow.png", 120, 168);
         let n_p = degrade_file(&narrow, &cfg).unwrap().params;
         assert!((n_p.rescale_k - 1.0).abs() < 1e-9);
-        assert_eq!((n_p.src_width, n_p.src_height), (400, 560));
+        assert_eq!((n_p.src_width, n_p.src_height), (120, 168));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn framing_never_cuts_content_at_train_res() {
         let dir = test_dir("trainframe");
-        let input = document_input(&dir, "in.png", 1280, 1800);
+        let input = document_input(&dir, "in.png", 320, 450);
         let mut seen = std::collections::HashSet::new();
         for seed in 0..8u64 {
             let mut cfg = cfg_base(seed, 0.9);
-            cfg.train_width = 512;
+            cfg.train_width = 128;
             let p = degrade_file(&input, &cfg).unwrap().params;
             seen.insert(p.frame_mode.clone());
-            assert_eq!(p.train_width, 512);
+            assert_eq!(p.train_width, 128);
             assert!((p.rescale_k - 0.4).abs() < 1e-6);
             assert_eq!(p.frame_safe_px, 3);
             for i in 0..4 {

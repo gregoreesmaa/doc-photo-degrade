@@ -81,9 +81,8 @@ pub fn bank_offset(rng: &mut ChaCha8Rng, tile: u32) -> (u32, u32) {
 }
 
 /// Banked paper-grain apply: `buf[i] += bank_val + warm[c]`, speckle via the
-/// uniform bank. Same layout/traversal as the direct loop (`chunks_exact_mut`
-/// row-major); values differ from the direct ChaCha-per-pixel stream by
-/// design (independent keyed stream), statistical parity holds.
+/// uniform bank. Row-major chunked tiling avoids per-pixel integer `%`/`/`
+/// while staying bit-exact with the direct tile formula.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_grain_banked(
     buf: &mut [f32],
@@ -102,24 +101,67 @@ pub fn apply_grain_banked(
     debug_assert_eq!(gauss.len(), (tile as usize) * (tile as usize));
     debug_assert_eq!(uniform.len(), (tile as usize) * (tile as usize));
     let t = tile as usize;
-    // Spatial tiling with channel decorrelation: pixel (x, y) channel c
-    // reads bank slot ((y+oy) % T) * T + ((x+ox) % T), offset by c·(n/3).
-    // The bank is built at the requested sigma, so values add directly.
     let n = gauss.len();
-    let third = n / 3;
     let stride = w as usize;
-    for (p, px) in buf.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-        let x = (p % stride) as u32;
-        let y = (p / stride) as u32;
-        let base = ((y + oy) % tile) as usize * t + ((x + ox) % tile) as usize;
-        let u = uniform[base % n];
+    if t == 0 || n == 0 || stride == 0 {
+        return;
+    }
+    let third = n / 3;
+    let two_third = 2 * third;
+    let ox_u = (ox as usize) % t;
+    let oy_u = (oy as usize) % t;
+    let total_px = buf.len() / 3;
+    let n_rows = total_px / stride;
+    for y in 0..n_rows {
+        let row_t = ((y + oy_u) % t) * t;
+        let row_buf = &mut buf[y * stride * 3..(y + 1) * stride * 3];
+        let mut x = 0usize;
+        let mut bx = ox_u;
+        while x < stride {
+            let chunk = (stride - x).min(t - bx);
+            let p_slice = &mut row_buf[x * 3..(x + chunk) * 3];
+            for (base, px) in (row_t + bx..).zip(p_slice.as_chunks_mut::<3>().0.iter_mut()) {
+                let u = uniform[base];
+                let mut i1 = base + third;
+                if i1 >= n {
+                    i1 -= n;
+                }
+                let mut i2 = base + two_third;
+                if i2 >= n {
+                    i2 -= n;
+                }
+                px[0] += gauss[base] + warm[0];
+                px[1] += gauss[i1] + warm[1];
+                px[2] += gauss[i2] + warm[2];
+                if u < speckle_prob {
+                    let u2_idx = if base + 1 < n { base + 1 } else { 0 };
+                    let dd = (10.0 + 25.0 * uniform[u2_idx]) * strength;
+                    px[0] -= dd;
+                    px[1] -= dd;
+                    px[2] -= dd;
+                }
+            }
+            x += chunk;
+            bx = 0;
+        }
+    }
+    // Handle any partial trailing row if `buf.len() / 3` is not a multiple of `stride`.
+    let rem_start = n_rows * stride;
+    for (p_off, px) in buf[rem_start * 3..]
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let p = rem_start + p_off;
+        let x = p % stride;
+        let y = p / stride;
+        let base = ((y + oy_u) % t) * t + ((x + ox_u) % t);
+        let u = uniform[base];
         for c in 0..3 {
             px[c] += gauss[(base + c * third) % n] + warm[c];
         }
         if u < speckle_prob {
-            // Speckle depth: one extra draw per hit in the direct loop
-            // (`gen_range(10..35) * s`); derive deterministically from the
-            // uniform bank (same distribution, no main-stream draw).
             let u2 = uniform[(base + 1) % n];
             let dd = (10.0 + 25.0 * u2) * strength;
             px[0] -= dd;
@@ -130,257 +172,60 @@ pub fn apply_grain_banked(
     let _ = (h, sigma);
 }
 
-/// Banked sensor-noise apply: `buf[i] += gauss`. One slot per float,
-/// row-major, tiled with the offset.
+/// Banked sensor-noise apply: `buf[i] += gauss`. Row-major chunked tiling
+/// avoids per-channel integer `%`/`/` while staying bit-exact.
 pub fn apply_noise_banked(buf: &mut [f32], w: u32, gauss: &[f32], tile: u32, ox: u32, oy: u32) {
     let t = tile as usize;
     let n = gauss.len();
     let stride = w as usize;
-    for (idx, v) in buf.iter_mut().enumerate() {
+    if t == 0 || n == 0 || stride == 0 {
+        return;
+    }
+    let third = n / 3;
+    let two_third = 2 * third;
+    let ox_u = (ox as usize) % t;
+    let oy_u = (oy as usize) % t;
+    let total_px = buf.len() / 3;
+    let n_rows = total_px / stride;
+    for y in 0..n_rows {
+        let row_t = ((y + oy_u) % t) * t;
+        let row_buf = &mut buf[y * stride * 3..(y + 1) * stride * 3];
+        let mut x = 0usize;
+        let mut bx = ox_u;
+        while x < stride {
+            let chunk = (stride - x).min(t - bx);
+            let p_slice = &mut row_buf[x * 3..(x + chunk) * 3];
+            for (base, px) in (row_t + bx..).zip(p_slice.as_chunks_mut::<3>().0.iter_mut()) {
+                let mut i1 = base + third;
+                if i1 >= n {
+                    i1 -= n;
+                }
+                let mut i2 = base + two_third;
+                if i2 >= n {
+                    i2 -= n;
+                }
+                px[0] += gauss[base];
+                px[1] += gauss[i1];
+                px[2] += gauss[i2];
+            }
+            x += chunk;
+            bx = 0;
+        }
+    }
+    let tail_start = n_rows * stride * 3;
+    for (off, v) in buf[tail_start..].iter_mut().enumerate() {
+        let idx = tail_start + off;
         let pix = idx / 3;
-        let x = (pix % stride) as u32;
-        let y = (pix / stride) as u32;
-        // Channel-decorrelated: each channel reads a different third of the
-        // bank stride so R/G/B never share a value at the same pixel.
+        let x = pix % stride;
+        let y = pix / stride;
         let c = idx % 3;
-        let gi = ((((y + oy) % tile) as usize * t + ((x + ox) % tile) as usize) + c * (n / 3)) % n;
+        let gi = (((y + oy_u) % t) * t + ((x + ox_u) % t) + c * third) % n;
         *v += gauss[gi];
     }
 }
 
 // ---------------------------------------------------------------------------
-// Lighting field: precompute (mult, add) per page geometry, then apply.
-// ---------------------------------------------------------------------------
-
-/// Precomputed lighting field: `out = clamp(buf * mult + add)`.
-/// `mult` folds shadow × vignette; `add` is the glare lift.
-/// Formula-identical to the direct stage-5 loop in `main.rs`.
-pub struct LightingField {
-    pub mult: Vec<f32>,
-    pub add: Vec<f32>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn precompute_lighting(
-    w: u32,
-    h: u32,
-    gx: f32,
-    gy: f32,
-    glare_radius: f32,
-    glare_alpha: f32,
-    sh_dx: f32,
-    sh_dy: f32,
-    shadow_strength: f32,
-    vignette_strength: f32,
-) -> LightingField {
-    let wf = w as f32;
-    let hf = h as f32;
-    let diag = (wf * wf + hf * hf).sqrt().max(1.0);
-    let cx = wf / 2.0;
-    let cy = hf / 2.0;
-    let max_d = (cx * cx + cy * cy).sqrt().max(1.0);
-    let mut mult = vec![0.0f32; (w * h) as usize];
-    let mut add = vec![0.0f32; (w * h) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let fx = x as f32;
-            let fy = y as f32;
-            let gd = ((fx - gx).powi(2) + (fy - gy).powi(2)).sqrt();
-            let g = (1.0 - gd / glare_radius).max(0.0);
-            let addv = glare_alpha * 255.0 * g * g;
-            let t = ((fx - cx) * sh_dx + (fy - cy) * sh_dy) / diag + 0.5;
-            let shadow = 1.0 - shadow_strength * t.clamp(0.0, 1.0);
-            let cd = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() / max_d;
-            let vig = 1.0 - vignette_strength * cd * cd;
-            let m = (shadow * vig).max(0.0);
-            let i = (y * w + x) as usize;
-            mult[i] = m;
-            add[i] = addv;
-        }
-    }
-    LightingField { mult, add }
-}
-
-pub fn apply_lighting_field(buf: &mut [f32], field: &LightingField) {
-    debug_assert_eq!(buf.len() / 3, field.mult.len());
-    for (px, i) in buf.as_chunks_mut::<3>().0.iter_mut().zip(0..) {
-        let m = field.mult[i];
-        let a = field.add[i];
-        px[0] = px[0] * m + a;
-        px[1] = px[1] * m + a;
-        px[2] = px[2] * m + a;
-    }
-}
-
-/// Direct reference (same formula, single pass) for parity tests.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub fn apply_lighting_direct(
-    buf: &mut [f32],
-    w: u32,
-    h: u32,
-    gx: f32,
-    gy: f32,
-    glare_radius: f32,
-    glare_alpha: f32,
-    sh_dx: f32,
-    sh_dy: f32,
-    shadow_strength: f32,
-    vignette_strength: f32,
-) {
-    let field = precompute_lighting(
-        w,
-        h,
-        gx,
-        gy,
-        glare_radius,
-        glare_alpha,
-        sh_dx,
-        sh_dy,
-        shadow_strength,
-        vignette_strength,
-    );
-    // Deliberately recompute inline (not via the field) so the parity test
-    // compares two independent evaluations of the same formula.
-    let wf = w as f32;
-    let hf = h as f32;
-    let diag = (wf * wf + hf * hf).sqrt().max(1.0);
-    let cx = wf / 2.0;
-    let cy = hf / 2.0;
-    let max_d = (cx * cx + cy * cy).sqrt().max(1.0);
-    for y in 0..h {
-        for x in 0..w {
-            let i = ((y * w + x) * 3) as usize;
-            let fx = x as f32;
-            let fy = y as f32;
-            let gd = ((fx - gx).powi(2) + (fy - gy).powi(2)).sqrt();
-            let g = (1.0 - gd / glare_radius).max(0.0);
-            let add = glare_alpha * 255.0 * g * g;
-            let t = ((fx - cx) * sh_dx + (fy - cy) * sh_dy) / diag + 0.5;
-            let shadow = 1.0 - shadow_strength * t.clamp(0.0, 1.0);
-            let cd = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() / max_d;
-            let vig = 1.0 - vignette_strength * cd * cd;
-            let m = (shadow * vig).max(0.0);
-            buf[i] = buf[i] * m + add;
-            buf[i + 1] = buf[i + 1] * m + add;
-            buf[i + 2] = buf[i + 2] * m + add;
-        }
-    }
-    let _ = field;
-}
-
-// ---------------------------------------------------------------------------
-// Bend warp field: precompute (src_x, src_y, shade) per dest pixel.
-// ---------------------------------------------------------------------------
-
-/// Precomputed bend displacement + shading. `apply_bend_field` resamples
-/// `src` through it; formula-identical to the stage-2 CPU loop in `lib.rs`.
-///
-/// Parity-tested library helper available for custom callers.
-#[allow(dead_code)]
-pub struct BendField {
-    pub sx: Vec<f32>,
-    pub sy: Vec<f32>,
-    pub shade: Vec<f32>,
-}
-
-fn spine_map_local(x: f32, spine_cx: f32, spine_w: f32, depth: f32, shade_amt: f32) -> (f32, f32) {
-    let t = (x - spine_cx) / spine_w.max(1.0);
-    let g = (-t * t).exp();
-    let sx = spine_cx + (x - spine_cx) * (1.0 - depth * g);
-    (sx, 1.0 - shade_amt * g)
-}
-
-/// `mode`: 0 = spine, 1 = ripple, 2 = edge. `edge_id`: 0 left, 1 right,
-/// 2 top, 3 bottom (edge mode only).
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub fn precompute_bend(
-    w: u32,
-    h: u32,
-    mode: u32,
-    edge_id: u32,
-    curl_px: f32,
-    curl_shade: f32,
-    spine_cx: f32,
-    spine_w: f32,
-    rip_fx: f32,
-    rip_fy: f32,
-    rip_ph: f32,
-) -> BendField {
-    let wf = w as f32;
-    let hf = h as f32;
-    let n = (w * h) as usize;
-    let mut sx = vec![0.0f32; n];
-    let mut sy = vec![0.0f32; n];
-    let mut shade = vec![0.0f32; n];
-    for y in 0..h {
-        let wave = 0.6 + 0.4 * ((std::f32::consts::PI * y as f32 / hf).sin());
-        for x in 0..w {
-            let i = (y * w + x) as usize;
-            let (px, py, sh) = if mode == 0 {
-                let depth = ((curl_px / wf) * 2.0).min(0.15);
-                let (mx, sh) = spine_map_local(x as f32, spine_cx, spine_w, depth, curl_shade);
-                (mx, y as f32, sh)
-            } else if mode == 1 {
-                let ox =
-                    curl_px * 0.5 * (std::f32::consts::TAU * rip_fx * y as f32 / hf + rip_ph).sin();
-                let oy =
-                    curl_px * 0.3 * (std::f32::consts::TAU * rip_fy * x as f32 / wf + rip_ph).cos();
-                let sh = 1.0
-                    - curl_shade
-                        * 0.4
-                        * (std::f32::consts::TAU * rip_fx * y as f32 / hf + rip_ph)
-                            .sin()
-                            .abs();
-                (x as f32 + ox, y as f32 + oy, sh)
-            } else {
-                let (edge, along_wave) = match edge_id {
-                    1 => (x as f32 / wf, wave),
-                    2 => (
-                        1.0 - y as f32 / hf,
-                        0.6 + 0.4 * ((std::f32::consts::PI * x as f32 / wf).sin()),
-                    ),
-                    3 => (
-                        y as f32 / hf,
-                        0.6 + 0.4 * ((std::f32::consts::PI * x as f32 / wf).sin()),
-                    ),
-                    _ => (1.0 - x as f32 / wf, wave),
-                };
-                let shift = curl_px * edge * edge * along_wave;
-                let (px, py) = match edge_id {
-                    1 => (x as f32 - shift, y as f32),
-                    2 => (x as f32, y as f32 + shift),
-                    3 => (x as f32, y as f32 - shift),
-                    _ => (x as f32 + shift, y as f32),
-                };
-                (px, py, 1.0 - curl_shade * edge * edge)
-            };
-            sx[i] = px;
-            sy[i] = py;
-            shade[i] = sh;
-        }
-    }
-    BendField { sx, sy, shade }
-}
-
-#[allow(dead_code)]
-pub fn apply_bend_field(dst: &mut [f32], src: &[f32], w: u32, h: u32, field: &BendField) {
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) as usize;
-            let p = crate::sample_bilinear(src, w, h, field.sx[i], field.sy[i]);
-            let o = i * 3;
-            let sh = field.shade[i];
-            dst[o] = p[0] * sh;
-            dst[o + 1] = p[1] * sh;
-            dst[o + 2] = p[2] * sh;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stamped damage library: coffee-ring sprite, fold-crease field, tear notch.
+// Stamped damage library: coffee-ring sprite, tear notch.
 // ---------------------------------------------------------------------------
 
 pub const COFFEE: [f32; 3] = [122.0, 82.0, 42.0];
@@ -1034,88 +879,6 @@ pub fn apply_paper_weave(
     sample
 }
 
-/// Direct reference for parity tests (same math, no stamp object).
-#[allow(dead_code)]
-pub fn apply_coffee_direct(buf: &mut [f32], w: u32, h: u32, cx: f32, cy: f32, r: f32) {
-    let bb = r as i64 + 2;
-    for dy in -bb..=bb {
-        for dx in -bb..=bb {
-            let d = ((dx * dx + dy * dy) as f32).sqrt();
-            if d < r {
-                let rim = (-((d - r) / (r * 0.12).max(1.0)).powi(2)).exp();
-                blend_px_local(buf, w, h, cx as i64 + dx, cy as i64 + dy, SEPIA, 0.18);
-                blend_px_local(
-                    buf,
-                    w,
-                    h,
-                    cx as i64 + dx,
-                    cy as i64 + dy,
-                    COFFEE,
-                    0.55 * rim,
-                );
-            }
-        }
-    }
-}
-
-/// Precomputed fold-crease field: `(mult, add)` per pixel from
-/// `(angle, pos_frac, strength, w, h)`. Same three branches as the direct
-/// crease loop in `lib.rs`.
-#[allow(dead_code)]
-pub struct CreaseField {
-    pub mult: Vec<f32>,
-    pub add: Vec<f32>,
-}
-
-#[allow(dead_code)]
-pub fn precompute_crease(
-    w: u32,
-    h: u32,
-    ang_rad: f32,
-    pos: f32,
-    cstr: f32,
-    shade_w: f32,
-) -> CreaseField {
-    let (nx, ny) = (ang_rad.cos(), ang_rad.sin());
-    let valley = (w.min(h) as f32 * 0.0016).clamp(1.0, 4.0);
-    let mut mult = vec![1.0f32; (w * h) as usize];
-    let mut add = vec![0.0f32; (w * h) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let cx = x as f32 - w as f32 / 2.0;
-            let cy = y as f32 - h as f32 / 2.0;
-            let d = cx * nx + cy * ny - (pos - 0.5) * (w.min(h)) as f32;
-            let i = (y * w + x) as usize;
-            let av = d.abs();
-            if av < valley {
-                mult[i] = 1.0 - 0.22 * cstr;
-            } else if (d - valley) > 0.0 && (d - valley) < 1.5 {
-                add[i] = 24.0 * cstr;
-            } else if d < 0.0 && av < shade_w {
-                mult[i] = 1.0 - 0.07 * cstr * (1.0 - av / shade_w);
-            }
-        }
-    }
-    CreaseField { mult, add }
-}
-
-#[allow(dead_code)]
-pub fn apply_crease_field(buf: &mut [f32], field: &CreaseField) {
-    for (px, i) in buf.as_chunks_mut::<3>().0.iter_mut().zip(0..) {
-        let m = field.mult[i];
-        let a = field.add[i];
-        if a != 0.0 {
-            for ch in px.iter_mut() {
-                *ch = (*ch + a).clamp(0.0, 255.0);
-            }
-        } else if m != 1.0 {
-            for ch in px.iter_mut() {
-                *ch *= m;
-            }
-        }
-    }
-}
-
 /// Precomputed tear-notch mask: half-width per row `f` in `[0, steps]`.
 /// `build` captures the mouth profile; `carve` stamps desk-tone rows —
 /// same rows in the same order as the direct `carve_notch`.
@@ -1260,150 +1023,38 @@ mod tests {
     }
 
     #[test]
-    fn lighting_field_matches_direct_bit_exact() {
-        let (w, h) = (96u32, 64u32);
-        let base: Vec<f32> = (0..w * h * 3).map(|i| (i % 251) as f32).collect();
-        let (gx, gy, gr, ga) = (30.0, 40.0, 50.0, 0.4);
-        let (dx, dy) = (0.6f32, 0.8f32);
-        let mut a = base.clone();
-        let mut b = base.clone();
-        let field = precompute_lighting(w, h, gx, gy, gr, ga, dx, dy, 0.3, 0.15);
-        apply_lighting_field(&mut a, &field);
-        apply_lighting_direct(&mut b, w, h, gx, gy, gr, ga, dx, dy, 0.3, 0.15);
-        assert!(max_abs(&a, &b) < 1e-3, "max diff {}", max_abs(&a, &b));
-    }
-
-    #[test]
-    fn bend_field_matches_direct_all_modes() {
-        // Direct reference loops replicate main.rs stage-2 math inline.
-        for (mode, edge) in [(0u32, 0u32), (1, 0), (2, 0), (2, 1), (2, 2), (2, 3)] {
-            let (w, h) = (80u32, 60u32);
-            let src: Vec<f32> = (0..w * h * 3).map(|i| ((i * 37) % 256) as f32).collect();
-            let (curl_px, curl_shade) = (9.0f32, 0.3f32);
-            let field = precompute_bend(
-                w, h, mode, edge, curl_px, curl_shade, 40.0, 6.0, 1.7, 1.3, 0.9,
-            );
-            let mut via_field = vec![0.0f32; src.len()];
-            apply_bend_field(&mut via_field, &src, w, h, &field);
-            // Inline direct evaluation with identical formulas.
-            let wf = w as f32;
-            let hf = h as f32;
-            let mut direct = vec![0.0f32; src.len()];
-            for y in 0..h {
-                let wave = 0.6 + 0.4 * ((std::f32::consts::PI * y as f32 / hf).sin());
-                for x in 0..w {
-                    let (sxx, syy, sh) = if mode == 0 {
-                        let depth = ((curl_px / wf) * 2.0).min(0.15);
-                        let t = (x as f32 - 40.0) / 6.0f32.max(1.0);
-                        let g = (-t * t).exp();
-                        (
-                            40.0 + (x as f32 - 40.0) * (1.0 - depth * g),
-                            y as f32,
-                            1.0 - curl_shade * g,
-                        )
-                    } else if mode == 1 {
-                        let ox = curl_px
-                            * 0.5
-                            * (std::f32::consts::TAU * 1.7 * y as f32 / hf + 0.9).sin();
-                        let oy = curl_px
-                            * 0.3
-                            * (std::f32::consts::TAU * 1.3 * x as f32 / wf + 0.9).cos();
-                        let sh = 1.0
-                            - curl_shade
-                                * 0.4
-                                * (std::f32::consts::TAU * 1.7 * y as f32 / hf + 0.9)
-                                    .sin()
-                                    .abs();
-                        (x as f32 + ox, y as f32 + oy, sh)
-                    } else {
-                        let (e, aw) = match edge {
-                            1 => (x as f32 / wf, wave),
-                            2 => (
-                                1.0 - y as f32 / hf,
-                                0.6 + 0.4 * ((std::f32::consts::PI * x as f32 / wf).sin()),
-                            ),
-                            3 => (
-                                y as f32 / hf,
-                                0.6 + 0.4 * ((std::f32::consts::PI * x as f32 / wf).sin()),
-                            ),
-                            _ => (1.0 - x as f32 / wf, wave),
-                        };
-                        let shift = curl_px * e * e * aw;
-                        let (px, py) = match edge {
-                            1 => (x as f32 - shift, y as f32),
-                            2 => (x as f32, y as f32 + shift),
-                            3 => (x as f32, y as f32 - shift),
-                            _ => (x as f32 + shift, y as f32),
-                        };
-                        (px, py, 1.0 - curl_shade * e * e)
-                    };
-                    let p = crate::sample_bilinear(&src, w, h, sxx, syy);
-                    let o = ((y * w + x) * 3) as usize;
-                    direct[o] = p[0] * sh;
-                    direct[o + 1] = p[1] * sh;
-                    direct[o + 2] = p[2] * sh;
-                }
-            }
-            assert!(
-                max_abs(&via_field, &direct) < 1e-3,
-                "mode {mode} edge {edge}: {}",
-                max_abs(&via_field, &direct)
-            );
-        }
-    }
-
-    #[test]
     fn coffee_stamp_matches_direct() {
         let (w, h) = (120u32, 100u32);
         let mut a = vec![240.0f32; (w * h * 3) as usize];
         let mut b = a.clone();
-        let stamp = precompute_coffee(9.0);
-        stamp_coffee(&mut a, w, h, 60.0, 50.0, &stamp);
-        apply_coffee_direct(&mut b, w, h, 60.0, 50.0, 9.0);
+        let (cx, cy, r) = (60.0f32, 50.0f32, 9.0f32);
+        let stamp = precompute_coffee(r);
+        stamp_coffee(&mut a, w, h, cx, cy, &stamp);
+        let bb = r as i64 + 2;
+        for dy in -bb..=bb {
+            for dx in -bb..=bb {
+                let d = ((dx * dx + dy * dy) as f32).sqrt();
+                if d < r {
+                    let rim = (-((d - r) / (r * 0.12).max(1.0)).powi(2)).exp();
+                    blend_px_local(&mut b, w, h, cx as i64 + dx, cy as i64 + dy, SEPIA, 0.18);
+                    blend_px_local(
+                        &mut b,
+                        w,
+                        h,
+                        cx as i64 + dx,
+                        cy as i64 + dy,
+                        COFFEE,
+                        0.55 * rim,
+                    );
+                }
+            }
+        }
         assert!(max_abs(&a, &b) < 1e-4, "max diff {}", max_abs(&a, &b));
         // Stamp actually marks the page.
         assert!(a
             .iter()
             .zip(b.iter())
             .any(|(x, y)| (x - 240.0).abs() > 1.0 && (x - y).abs() < 1e-4));
-    }
-
-    #[test]
-    fn crease_field_matches_direct() {
-        let (w, h) = (110u32, 90u32);
-        let base: Vec<f32> = (0..w * h * 3).map(|i| 200.0 + (i % 17) as f32).collect();
-        let mut a = base.clone();
-        let mut b = base.clone();
-        let field = precompute_crease(w, h, 35.0f32.to_radians(), 0.6, 0.8, 4.0);
-        apply_crease_field(&mut a, &field);
-        // Direct triple-branch loop (same as main.rs).
-        let ang = 35.0f32.to_radians();
-        let (nx, ny) = (ang.cos(), ang.sin());
-        let valley = (w.min(h) as f32 * 0.0016).clamp(1.0, 4.0);
-        for y in 0..h {
-            for x in 0..w {
-                let cx = x as f32 - w as f32 / 2.0;
-                let cy = y as f32 - h as f32 / 2.0;
-                let d = cx * nx + cy * ny - (0.6 - 0.5) * (w.min(h)) as f32;
-                let i = ((y * w + x) * 3) as usize;
-                let av = d.abs();
-                if av < valley {
-                    for c in 0..3 {
-                        b[i + c] *= 1.0 - 0.22 * 0.8;
-                    }
-                } else if (d - valley) > 0.0 && (d - valley) < 1.5 {
-                    for c in 0..3 {
-                        b[i + c] = (b[i + c] + 24.0 * 0.8).clamp(0.0, 255.0);
-                    }
-                } else if d < 0.0 && av < 4.0 {
-                    let f = 1.0 - 0.07 * 0.8 * (1.0 - av / 4.0);
-                    for c in 0..3 {
-                        b[i + c] *= f;
-                    }
-                }
-            }
-        }
-        assert!(max_abs(&a, &b) < 1e-3, "max diff {}", max_abs(&a, &b));
     }
 
     #[test]

@@ -121,6 +121,19 @@ pub fn apply_with(
         // fixed by scaling the angular frequency (÷1.0 = legacy exactly).
         let laid_w = 1.2566 / px;
         let (wcx, wcy, wr) = (p.water_x * wf, p.water_y * hf, p.water_radius * min_dim);
+        // Precompute x-only sine LUTs (bit-exact vs per-pixel evaluation;
+        // eliminates 3 * w * h redundant sin() calls).
+        let wf_denom = wf.max(1.0);
+        let wu = w as usize;
+        let mut sin_x1 = Vec::with_capacity(wu);
+        let mut sin_x2 = Vec::with_capacity(wu);
+        let mut sin_xc = Vec::with_capacity(wu);
+        for x in 0..w {
+            let fx = x as f32 / wf_denom;
+            sin_x1.push((fx * 18.85 + o2).sin());
+            sin_x2.push((fx * 43.98 + o1).sin());
+            sin_xc.push((fx * 12.57 + o3).sin());
+        }
         for y in 0..h {
             let fy = y as f32 / hf.max(1.0);
             let sy1 = (fy * 18.85 + o1).sin(); // ~3 vertical blotch cycles
@@ -132,9 +145,10 @@ pub fn apply_with(
                 if i + 2 >= buf.len() {
                     continue;
                 }
-                let fx = x as f32 / wf.max(1.0);
+                let xu = x as usize;
+                let fx = x as f32 / wf_denom;
                 // Layered sine blotch field, -1..1.
-                let m = (fx * 18.85 + o2).sin() * sy1 * 0.6 + (fx * 43.98 + o1).sin() * sy2 * 0.4;
+                let m = sin_x1[xu] * sy1 * 0.6 + sin_x2[xu] * sy2 * 0.4;
                 // Aged border band: 0 inside, 1 at the sheet rim.
                 let d = fx.min(1.0 - fx).min(fy).min(1.0 - fy);
                 let band = ((0.06 - d) / 0.06).clamp(0.0, 1.0);
@@ -150,7 +164,7 @@ pub fn apply_with(
                 r -= edg * 30.0 * band2;
                 g -= edg * 34.0 * band2;
                 b -= edg * 44.0 * band2;
-                let c = 1.0 + (fx * 12.57 + o3).sin() * syc * cok * 0.05; // cockling
+                let c = 1.0 + sin_xc[xu] * syc * cok * 0.05; // cockling
                 r *= c;
                 g *= c;
                 b *= c;
@@ -512,7 +526,7 @@ pub fn apply_porous_ink_spread(buf: &mut [f32], w: u32, h: u32, spread: f32) {
     for y in 1..(h - 1) as usize {
         let base = y * row_len;
         let next_base = (y + 1) * row_len;
-        prev.copy_from_slice(&curr);
+        std::mem::swap(&mut prev, &mut curr);
         curr.copy_from_slice(&buf[base..base + row_len]);
         for x in 1..(w - 1) as usize {
             let o = x * 3;

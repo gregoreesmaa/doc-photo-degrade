@@ -20,13 +20,18 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 doc-photo-degrade-gpu = { path = "crates/doc-photo-degrade-gpu", version = "0.3.0" }
 fast_image_resize = "6.1.0"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 pollster = "0.3"
 rand = "0.8"
 rand_chacha = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-wgpu = "30"
+wgpu = { version = "30", default-features = false, features = ["wgsl", "vulkan", "dx12", "metal"] }
 zune-jpeg = "0.5.15"
 zune-png = "0.5.2"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
